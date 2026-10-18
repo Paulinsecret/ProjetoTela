@@ -16,17 +16,12 @@ const state = {
   // Captura local (quando EU estou compartilhando a tela)
   localScreenStream: null,
   localExtraAudioStream: null,
-  localFileVideoEl: null,
-  vuInterval: null,
   localQuality: null,
   isSharing: false,
 
   // Conexões WebRTC Full-ICE (STUN + IPv6 + NAT Hole-Punching)
   p2pSenders: new Map(),
   p2pReceivers: new Map(),
-
-  // Gravadores de fallback via WebSocket Tunnel (quando operadora tem CGNAT estrito)
-  wsRelayRecorders: new Map(),
 
   // Mapa de transmissões ativas na sala: streamId -> StreamEntry
   streams: new Map(),
@@ -95,18 +90,6 @@ const dom = {
   btnCopyUrl: document.getElementById('btn-copy-url'),
   networkIpsList: document.getElementById('network-ips-list'),
 
-  firefoxShareModal: document.getElementById('firefox-share-modal'),
-  btnCloseFirefoxModal: document.getElementById('btn-close-firefox-modal'),
-  chkFirefoxIncludeAudio: document.getElementById('chk-firefox-include-audio'),
-  firefoxAudioConfigArea: document.getElementById('firefox-audio-config-area'),
-  selectFirefoxAudioDevice: document.getElementById('select-firefox-audio-device'),
-  btnFirefoxTestAudio: document.getElementById('btn-firefox-test-audio'),
-  firefoxAudioStatus: document.getElementById('firefox-audio-status'),
-  firefoxVuBar: document.getElementById('firefox-vu-bar'),
-  btnFirefoxStartShare: document.getElementById('btn-firefox-start-share'),
-  btnFirefoxShareFile: document.getElementById('btn-firefox-share-file'),
-  inputLocalVideoFile: document.getElementById('input-local-video-file'),
-
   btnShareScreen: document.getElementById('btn-share-screen'),
   btnShareLabel: document.getElementById('btn-share-label'),
   btnEmptyShare: document.getElementById('btn-empty-share'),
@@ -121,38 +104,35 @@ const dom = {
 };
 
 // ============================================================================
-// DESBLOQUEIO UNIVERSAL DE ÁUDIO (FIREFOX / CHROME / SAFARI / MOBILE)
+// DESBLOQUEIO UNIVERSAL DE ÁUDIO (APENAS PARA TRANSMISSÕES DOS AMIGOS)
 // ============================================================================
 function unlockGlobalAudioPlayback() {
-  try {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (AudioContextClass) {
-      if (!state.audioCtx) {
-        state.audioCtx = new AudioContextClass();
-      }
-      if (state.audioCtx.state === 'suspended') {
-        state.audioCtx.resume().catch(() => {});
-      }
-    }
-  } catch {}
-
-  // Tenta desmutar todos os vídeos remotos que estavam bloqueados por Autoplay
   for (const entry of state.streams.values()) {
-    if (!entry.isLocal && entry.videoEl && !entry.userManuallyMuted) {
+    // NUNCA desmuta a própria transmissão local (entry.isLocal) automaticamente!
+    if (
+      !entry.isLocal &&
+      entry.videoEl &&
+      !entry.userManuallyMuted &&
+      entry.videoEl.muted
+    ) {
       entry.videoEl.muted = false;
-      entry.videoEl.play().then(() => {
-        if (entry.unlockBannerEl) {
-          entry.unlockBannerEl.classList.add('hidden');
-        }
-        if (entry.muteBtnEl) {
-          entry.muteBtnEl.textContent = 'Som Ativo';
-        }
-      }).catch(() => {});
+      entry.videoEl
+        .play()
+        .then(() => {
+          if (entry.unlockBannerEl) {
+            entry.unlockBannerEl.classList.add('hidden');
+          }
+          if (entry.muteBtnEl) {
+            entry.muteBtnEl.textContent = 'Som Ativo';
+          }
+        })
+        .catch(() => {
+          entry.videoEl.muted = true;
+        });
     }
   }
 }
 
-// Qualquer clique na página já libera o contexto de áudio do navegador
 document.addEventListener('click', unlockGlobalAudioPlayback, { passive: true });
 
 // ============================================================================
@@ -174,7 +154,7 @@ async function requestAndPopulateAudioDevices(showPrompt = false) {
         t.stop();
       }
       showToast('Permissão de áudio concedida! Dispositivos carregados.');
-    } catch (err) {
+    } catch {
       showToast('Permissão de áudio negada ou nenhum dispositivo encontrado.');
       return;
     }
@@ -256,7 +236,7 @@ function getSelectedQualityConfig() {
   };
 }
 
-function enhanceSdpForStereoAudio(sdp, bitrateMbps = 12) {
+function enhanceSdpForStereoAudio(sdp) {
   if (!sdp || typeof sdp !== 'string') return sdp;
 
   // 1. Áudio Opus Estéreo 256kbps
@@ -272,20 +252,26 @@ function enhanceSdpForStereoAudio(sdp, bitrateMbps = 12) {
   out = out.replace(/max-fs=\d+/g, 'max-fs=8160');
   out = out.replace(/max-mbps=\d+/g, 'max-mbps=489600');
 
-  // 4. Força o estimador de banda WebRTC a iniciar em 8 Mbps (sem cair para 720p na largada)
-  const maxKbps = bitrateMbps * 1000;
-  out = out.replace(
-    /(a=fmtp:\d+ (?:level-asymmetry-allowed|profile-id|packetization-mode)[^\r\n]*)/g,
-    `$1;x-google-start-bitrate=8000;x-google-min-bitrate=5000;x-google-max-bitrate=${maxKbps}`
-  );
-
   return out;
 }
 
 async function applyHighQualitySenderParams(pc, quality) {
   if (!pc || !quality) return;
   for (const sender of pc.getSenders()) {
-    if (sender.track && sender.track.kind === 'video') {
+    if (!sender.track) continue;
+
+    if (sender.track.kind === 'audio') {
+      try {
+        const aParams = sender.getParameters();
+        if (!aParams.encodings || aParams.encodings.length === 0) {
+          aParams.encodings = [{}];
+        }
+        // Prioridade máxima para os pacotes de áudio na rede para nunca atrasarem atrás do vídeo 1080p60
+        aParams.encodings[0].priority = 'high';
+        aParams.encodings[0].networkPriority = 'high';
+        await sender.setParameters(aParams);
+      } catch {}
+    } else if (sender.track.kind === 'video') {
       try {
         const params = sender.getParameters();
         if (!params.encodings || params.encodings.length === 0) {
@@ -299,48 +285,6 @@ async function applyHighQualitySenderParams(pc, quality) {
       } catch {}
     }
   }
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function base64ToUint8Array(base64) {
-  const binary = atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function getSupportedRecorderMimeType(hasAudio = true) {
-  const withAudio = [
-    'video/webm;codecs=h264,opus',
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm'
-  ];
-  const videoOnly = [
-    'video/webm;codecs=h264',
-    'video/webm;codecs=vp9',
-    'video/webm;codecs=vp8',
-    'video/webm'
-  ];
-  const candidates = hasAudio ? withAudio : videoOnly;
-  for (const mime of candidates) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mime)) {
-      return mime;
-    }
-  }
-  return '';
 }
 
 // ============================================================================
@@ -594,13 +538,13 @@ function startPingLoop() {
 }
 
 // ============================================================================
-// MOTOR WEBRTC FULL-ICE + FALLBACK AUTOMÁTICO DE RELAY WEBSOCKET (ANTI-CGNAT)
+// MOTOR WEBRTC FULL-ICE COM SINCRONIA NATIVA DE ÁUDIO/VÍDEO (RTCP LIP-SYNC)
 // ============================================================================
 async function requestFullIceStream(streamerPeerId, streamerDisplayName, meta = {}) {
   if (!streamerPeerId || streamerPeerId === state.peerId) return;
 
   const streamId = `stream-${streamerPeerId}`;
-  const entry = upsertStreamTile({
+  upsertStreamTile({
     streamId,
     peerId: streamerPeerId,
     displayName: streamerDisplayName,
@@ -613,147 +557,6 @@ async function requestFullIceStream(streamerPeerId, streamerDisplayName, meta = 
     signalType: 'request-stream',
     payload: { meta }
   });
-
-  if (entry.fallbackTimer) clearTimeout(entry.fallbackTimer);
-  entry.fallbackTimer = setTimeout(() => {
-    const current = state.streams.get(streamId);
-    if (!current || current.isLocal || current.usingWsRelay) return;
-    const hasVideoFrames = current.videoEl && current.videoEl.videoWidth > 0;
-    if (!hasVideoFrames) {
-      console.log('[Stage] Ativando Relay via Túnel WebSocket (CGNAT detectado)...');
-      sendRequest('p2pSignal', {
-        targetPeerId: streamerPeerId,
-        signalType: 'request-ws-relay',
-        payload: {}
-      }).catch(() => {});
-    }
-  }, 4000);
-}
-
-function startWsRelayForViewer(viewerPeerId) {
-  if (!state.localScreenStream) return;
-
-  if (state.wsRelayRecorders.has(viewerPeerId)) {
-    try {
-      state.wsRelayRecorders.get(viewerPeerId).stop();
-    } catch {}
-    state.wsRelayRecorders.delete(viewerPeerId);
-  }
-
-  const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
-  const mimeType = getSupportedRecorderMimeType(hasAudio);
-  if (!mimeType) return;
-
-  const quality = state.localQuality || getSelectedQualityConfig();
-  let recorder;
-  try {
-    recorder = new MediaRecorder(state.localScreenStream, {
-      mimeType,
-      videoBitsPerSecond: Math.min(quality.maxBitrateBps, 8000000),
-      audioBitsPerSecond: 192000
-    });
-  } catch {
-    recorder = new MediaRecorder(state.localScreenStream);
-  }
-
-  let seq = 0;
-  recorder.ondataavailable = async (ev) => {
-    if (!ev.data || ev.data.size === 0) return;
-    if (!state.localScreenStream) {
-      try {
-        recorder.stop();
-      } catch {}
-      return;
-    }
-    try {
-      const buf = await ev.data.arrayBuffer();
-      const chunkB64 = arrayBufferToBase64(buf);
-      await sendRequest('p2pSignal', {
-        targetPeerId: viewerPeerId,
-        signalType: 'ws-relay-chunk',
-        payload: {
-          seq: seq++,
-          mimeType: recorder.mimeType || mimeType,
-          chunkB64,
-          meta: {
-            resolution: quality.label,
-            bitrateMbps: quality.bitrateMbps,
-            codec: 'TUNNEL-RELAY',
-            hasAudio
-          }
-        }
-      });
-    } catch {}
-  };
-
-  recorder.start(100);
-  state.wsRelayRecorders.set(viewerPeerId, recorder);
-}
-
-function handleIncomingWsRelayChunk(fromPeerId, fromDisplayName, payload) {
-  const streamId = `stream-${fromPeerId}`;
-  const entry = upsertStreamTile({
-    streamId,
-    peerId: fromPeerId,
-    displayName: fromDisplayName,
-    isLocal: false,
-    meta: payload.meta || {}
-  });
-
-  const bytes = base64ToUint8Array(payload.chunkB64);
-  entry.wsRelayBytes = (entry.wsRelayBytes || 0) + bytes.byteLength;
-
-  if (!entry.usingWsRelay || payload.seq === 0) {
-    entry.usingWsRelay = true;
-    entry.wsChunkQueue = [];
-
-    const ms = new MediaSource();
-    entry.mediaSource = ms;
-    if (entry.videoEl) {
-      entry.videoEl.srcObject = null;
-      entry.videoEl.src = URL.createObjectURL(ms);
-      entry.videoEl.muted = Boolean(entry.userManuallyMuted);
-    }
-
-    ms.addEventListener('sourceopen', () => {
-      try {
-        const sb = ms.addSourceBuffer(payload.mimeType);
-        sb.mode = 'sequence';
-        entry.sourceBuffer = sb;
-
-        sb.addEventListener('updateend', () => {
-          if (entry.wsChunkQueue.length > 0 && !sb.updating) {
-            sb.appendBuffer(entry.wsChunkQueue.shift());
-          }
-          if (entry.videoEl && entry.videoEl.paused) {
-            tryPlayRemoteVideoWithAudio(entry);
-          }
-          if (entry.videoEl && entry.videoEl.buffered.length > 0) {
-            const end = entry.videoEl.buffered.end(entry.videoEl.buffered.length - 1);
-            if (end - entry.videoEl.currentTime > 0.75) {
-              entry.videoEl.currentTime = end - 0.15;
-            }
-          }
-        });
-
-        if (entry.wsChunkQueue.length > 0 && !sb.updating) {
-          sb.appendBuffer(entry.wsChunkQueue.shift());
-        }
-      } catch (err) {
-        console.warn('[MSE Relay Error]:', err);
-      }
-    });
-  }
-
-  if (entry.sourceBuffer && !entry.sourceBuffer.updating && entry.wsChunkQueue.length === 0) {
-    try {
-      entry.sourceBuffer.appendBuffer(bytes);
-    } catch {
-      entry.wsChunkQueue.push(bytes);
-    }
-  } else if (entry.wsChunkQueue) {
-    entry.wsChunkQueue.push(bytes);
-  }
 }
 
 async function flushPendingCandidates(connObj) {
@@ -768,16 +571,6 @@ async function flushPendingCandidates(connObj) {
 
 async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType, payload }) {
   try {
-    if (signalType === 'request-ws-relay') {
-      startWsRelayForViewer(fromPeerId);
-      return;
-    }
-
-    if (signalType === 'ws-relay-chunk') {
-      handleIncomingWsRelayChunk(fromPeerId, fromDisplayName, payload);
-      return;
-    }
-
     // 1. Espectador pediu nosso stream -> criamos RTCPeerConnection de envio
     if (signalType === 'request-stream') {
       if (!state.localScreenStream) return;
@@ -809,6 +602,9 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
       const quality = state.localQuality || getSelectedQualityConfig();
       const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
 
+      // IMPORTANTE PARA LIP-SYNC:
+      // Tanto a trilha de vídeo quanto a de áudio são adicionadas vinculadas ao MESMO state.localScreenStream,
+      // gerando o mesmo identificador a=msid no SDP para que o navegador sincronize áudio e vídeo!
       for (const track of state.localScreenStream.getTracks()) {
         const sender = pc.addTrack(track, state.localScreenStream);
 
@@ -820,7 +616,6 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
               if (caps && caps.codecs) {
                 const preferred = caps.codecs
                   .filter((c) => c.mimeType.toLowerCase().includes(quality.codec.toLowerCase()))
-                  // Prioriza perfis H.264 de nível alto (Level 4.2/5.0/5.1 para 1080p60) acima do Level 3.1 (1f = 720p30)
                   .sort((a, b) => {
                     const aFmtp = a.sdpFmtpLine || '';
                     const bFmtp = b.sdpFmtpLine || '';
@@ -843,7 +638,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
       const offer = await pc.createOffer();
       const enhancedOffer = {
         type: offer.type,
-        sdp: enhanceSdpForStereoAudio(offer.sdp, quality.bitrateMbps)
+        sdp: enhanceSdpForStereoAudio(offer.sdp)
       };
       await pc.setLocalDescription(enhancedOffer);
       await applyHighQualitySenderParams(pc, quality);
@@ -893,11 +688,27 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 
       pc.ontrack = (ev) => {
         const track = ev.track;
+        // Usa o MediaStream sincronizado nativo do WebRTC (ev.streams[0]) para manter o Lip-Sync (RTCP SR)
+        const nativeSyncedStream = ev.streams && ev.streams[0] ? ev.streams[0] : null;
+
+        // Iguala o buffer de recepção de áudio e vídeo para que o vídeo não adiantem em relação ao som
+        try {
+          if (ev.receiver) {
+            if ('playoutDelayHint' in ev.receiver) {
+              ev.receiver.playoutDelayHint = 0.04;
+            }
+            if ('jitterBufferTarget' in ev.receiver) {
+              ev.receiver.jitterBufferTarget = 40;
+            }
+          }
+        } catch {}
+
         upsertStreamTile({
           streamId,
           peerId: fromPeerId,
           displayName: fromDisplayName,
           isLocal: false,
+          remoteStream: nativeSyncedStream,
           videoTrack: track.kind === 'video' ? track : undefined,
           audioTrack: track.kind === 'audio' ? track : undefined,
           p2pPc: pc,
@@ -911,7 +722,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
       const answer = await pc.createAnswer();
       const enhancedAnswer = {
         type: answer.type,
-        sdp: enhanceSdpForStereoAudio(answer.sdp, payload.meta?.bitrateMbps || 12)
+        sdp: enhanceSdpForStereoAudio(answer.sdp)
       };
       await pc.setLocalDescription(enhancedAnswer);
 
@@ -930,13 +741,11 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
         const quality = state.localQuality || getSelectedQualityConfig();
         const enhancedRemote = {
           type: payload.sdp.type,
-          sdp: enhanceSdpForStereoAudio(payload.sdp.sdp, quality.bitrateMbps)
+          sdp: enhanceSdpForStereoAudio(payload.sdp.sdp)
         };
         await senderObj.pc.setRemoteDescription(new RTCSessionDescription(enhancedRemote));
         await flushPendingCandidates(senderObj);
         await applyHighQualitySenderParams(senderObj.pc, quality);
-        setTimeout(() => applyHighQualitySenderParams(senderObj.pc, quality), 800);
-        setTimeout(() => applyHighQualitySenderParams(senderObj.pc, quality), 2500);
       }
       return;
     }
@@ -970,272 +779,9 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 }
 
 // ============================================================================
-// ASSISTENTE DE ÁUDIO + TELA PARA FIREFOX E DISPOSITIVOS DE ÁUDIO
+// CAPTURA DIRETA ESTILO DISCORD (1 CLIQUE -> SELETOR NATIVO DE TELA)
 // ============================================================================
-function stopVuMeter() {
-  if (state.vuInterval) {
-    clearInterval(state.vuInterval);
-    state.vuInterval = null;
-  }
-  if (dom.firefoxVuBar) {
-    dom.firefoxVuBar.style.width = '0%';
-  }
-}
-
-function startVuMeterForStream(stream) {
-  stopVuMeter();
-  if (!stream || stream.getAudioTracks().length === 0) return;
-
-  try {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
-    if (!state.audioCtx) {
-      state.audioCtx = new AudioContextClass();
-    }
-    if (state.audioCtx.state === 'suspended') {
-      state.audioCtx.resume().catch(() => {});
-    }
-
-    const source = state.audioCtx.createMediaStreamSource(stream);
-    const analyser = state.audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    state.vuInterval = setInterval(() => {
-      if (!stream.active || stream.getAudioTracks().length === 0) {
-        stopVuMeter();
-        return;
-      }
-      analyser.getByteFrequencyData(dataArray);
-      let sum = 0;
-      for (let i = 0; i < dataArray.length; i++) {
-        sum += dataArray[i];
-      }
-      const avg = sum / dataArray.length;
-      const pct = Math.min(100, Math.round((avg / 90) * 100));
-      if (dom.firefoxVuBar) {
-        dom.firefoxVuBar.style.width = `${pct}%`;
-      }
-    }, 80);
-  } catch {}
-}
-
-async function populateFirefoxModalAudioDevices() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices || !dom.selectFirefoxAudioDevice) {
-    return;
-  }
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const audioInputs = devices.filter((d) => d.kind === 'audioinput');
-    const prevValue = dom.selectFirefoxAudioDevice.value;
-
-    dom.selectFirefoxAudioDevice.innerHTML = `
-      <option value="default">Padrão Selecionado no Popup do Firefox (Mixagem Estéreo / Mic)</option>
-    `;
-
-    let preferredLoopbackId = null;
-    audioInputs.forEach((dev, idx) => {
-      const opt = document.createElement('option');
-      opt.value = dev.deviceId;
-      const label = dev.label || `Dispositivo de Áudio #${idx + 1}`;
-      opt.textContent = label;
-      if (/mixagem|stereo mix|what u hear|loopback|cable|virtual|wave/i.test(label)) {
-        opt.textContent = `★ ${label} (Áudio do Sistema/PC)`;
-        if (!preferredLoopbackId) preferredLoopbackId = dev.deviceId;
-      }
-      dom.selectFirefoxAudioDevice.appendChild(opt);
-    });
-
-    if (
-      prevValue &&
-      prevValue !== 'default' &&
-      [...dom.selectFirefoxAudioDevice.options].some((o) => o.value === prevValue)
-    ) {
-      dom.selectFirefoxAudioDevice.value = prevValue;
-    } else if (preferredLoopbackId) {
-      dom.selectFirefoxAudioDevice.value = preferredLoopbackId;
-    }
-  } catch {}
-}
-
-async function authorizeAndPreviewFirefoxAudio() {
-  unlockGlobalAudioPlayback();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast('Seu navegador bloqueou o acesso a dispositivos de áudio.');
-    return null;
-  }
-
-  try {
-    if (state.localExtraAudioStream) {
-      for (const t of state.localExtraAudioStream.getTracks()) {
-        try {
-          t.stop();
-        } catch {}
-      }
-      state.localExtraAudioStream = null;
-    }
-
-    const selectedDeviceId = dom.selectFirefoxAudioDevice ? dom.selectFirefoxAudioDevice.value : 'default';
-    const audioConstraints = {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false
-    };
-    if (selectedDeviceId && selectedDeviceId !== 'default') {
-      audioConstraints.deviceId = { exact: selectedDeviceId };
-    }
-
-    const audioStream = await navigator.mediaDevices.getUserMedia({
-      audio: audioConstraints
-    });
-
-    state.localExtraAudioStream = audioStream;
-    await populateFirefoxModalAudioDevices();
-    await requestAndPopulateAudioDevices(false);
-
-    const track = audioStream.getAudioTracks()[0];
-    const trackLabel = track && track.label ? track.label : 'Dispositivo Autorizado';
-
-    if (dom.firefoxAudioStatus) {
-      dom.firefoxAudioStatus.textContent = `✓ Áudio Conectado: ${trackLabel}`;
-      dom.firefoxAudioStatus.classList.add('status-ready');
-    }
-
-    startVuMeterForStream(audioStream);
-
-    // Se o usuário já estiver transmitindo a tela no momento, injeta o áudio ao vivo imediatamente!
-    if (state.isSharing && state.localScreenStream) {
-      await injectAudioStreamIntoLiveShare(audioStream);
-      if (dom.firefoxShareModal) {
-        dom.firefoxShareModal.classList.add('hidden');
-      }
-      stopVuMeter();
-    }
-
-    return audioStream;
-  } catch (err) {
-    if (dom.firefoxAudioStatus) {
-      dom.firefoxAudioStatus.textContent =
-        'Permissão de áudio não concedida. Clique em "1. Autorizar e Testar Áudio" e permita no topo do Firefox.';
-      dom.firefoxAudioStatus.classList.remove('status-ready');
-    }
-    showToast('Permissão de áudio negada ou cancelada no navegador.', 5000);
-    return null;
-  }
-}
-
-function openFirefoxShareModal() {
-  unlockGlobalAudioPlayback();
-  populateFirefoxModalAudioDevices();
-  if (dom.firefoxShareModal) {
-    dom.firefoxShareModal.classList.remove('hidden');
-  }
-  if (state.localExtraAudioStream && state.localExtraAudioStream.getAudioTracks().length > 0) {
-    const t = state.localExtraAudioStream.getAudioTracks()[0];
-    if (dom.firefoxAudioStatus) {
-      dom.firefoxAudioStatus.textContent = `✓ Áudio Conectado: ${t.label || 'Ativo'}`;
-      dom.firefoxAudioStatus.classList.add('status-ready');
-    }
-    startVuMeterForStream(state.localExtraAudioStream);
-  } else if (dom.firefoxAudioStatus) {
-    dom.firefoxAudioStatus.textContent =
-      'Clique em "1. Autorizar e Testar Áudio" ou clique direto no botão 2 para o Firefox pedir Tela + Áudio.';
-    dom.firefoxAudioStatus.classList.remove('status-ready');
-  }
-}
-
-async function injectAudioStreamIntoLiveShare(audioStream) {
-  if (!state.localScreenStream || !audioStream) return;
-
-  for (const oldAudio of state.localScreenStream.getAudioTracks()) {
-    if (!audioStream.getAudioTracks().some((t) => t.id === oldAudio.id)) {
-      state.localScreenStream.removeTrack(oldAudio);
-      try {
-        oldAudio.stop();
-      } catch {}
-    }
-  }
-
-  for (const newAudio of audioStream.getAudioTracks()) {
-    if (!state.localScreenStream.getAudioTracks().some((t) => t.id === newAudio.id)) {
-      state.localScreenStream.addTrack(newAudio);
-    }
-  }
-
-  const streamId = `stream-${state.peerId}`;
-  const quality = state.localQuality || getSelectedQualityConfig();
-  const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
-  const meta = {
-    resolution: quality.label,
-    bitrateMbps: quality.bitrateMbps,
-    codec: quality.codec,
-    hasAudio
-  };
-
-  const localEntry = state.streams.get(streamId);
-  if (localEntry) {
-    localEntry.meta = { ...localEntry.meta, hasAudio };
-    updateAudioBadgeUI(localEntry);
-    if (localEntry.liveAudioBtnEl) {
-      localEntry.liveAudioBtnEl.textContent = '🎤 Trocar Fonte de Áudio';
-      localEntry.liveAudioBtnEl.classList.remove('btn-add-audio-live');
-    }
-  }
-
-  await sendRequest('announceStream', { streamId, meta });
-
-  // Renegocia todas as conexões WebRTC ativas para enviar a nova trilha de áudio ao vivo!
-  for (const [viewerPeerId, senderObj] of state.p2pSenders.entries()) {
-    try {
-      const pc = senderObj.pc;
-      for (const aTrack of state.localScreenStream.getAudioTracks()) {
-        const alreadySent = pc.getSenders().some((s) => s.track && s.track.id === aTrack.id);
-        if (!alreadySent) {
-          pc.addTrack(aTrack, state.localScreenStream);
-        }
-      }
-      const offer = await pc.createOffer();
-      const enhancedOffer = {
-        type: offer.type,
-        sdp: enhanceSdpForStereoAudio(offer.sdp, quality.bitrateMbps)
-      };
-      await pc.setLocalDescription(enhancedOffer);
-      await applyHighQualitySenderParams(pc, quality);
-
-      await sendRequest('p2pSignal', {
-        targetPeerId: viewerPeerId,
-        signalType: 'offer',
-        payload: {
-          sdp: pc.localDescription,
-          meta
-        }
-      });
-    } catch (err) {
-      console.warn('[Live Audio Renegotiation Error]:', err);
-    }
-  }
-
-  // Se houver espectadores em Relay WebSocket, reinicia o gravador com áudio incluso
-  for (const viewerPeerId of state.wsRelayRecorders.keys()) {
-    startWsRelayForViewer(viewerPeerId);
-  }
-
-  showToast('Áudio conectado e transmitindo ao vivo para a sala!');
-}
-
-async function attachLiveAudioToActiveStream() {
-  if (isFirefoxBrowser) {
-    openFirefoxShareModal();
-    return;
-  }
-  await authorizeAndPreviewFirefoxAudio();
-}
-
-// ============================================================================
-// CAPTURA UNIVERSAL DE TELA + ÁUDIO (CHROME / EDGE / FIREFOX / MOBILE)
-// ============================================================================
-async function startScreenShare(fromFirefoxModal = false) {
+async function startScreenShare() {
   unlockGlobalAudioPlayback();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -1249,31 +795,13 @@ async function startScreenShare(fromFirefoxModal = false) {
 
   const quality = getSelectedQualityConfig();
   state.localQuality = quality;
+  const wantAudio = quality.audioSource !== 'none';
 
-  // No Firefox, o seletor nativo de tela da Mozilla não tem a caixinha "Compartilhar áudio do sistema" igual ao Edge.
-  // Por isso abrimos nosso modal estilo Edge antes da captura para o usuário ativar/escolher o áudio!
-  if (isFirefoxBrowser && !fromFirefoxModal && quality.audioSource !== 'none') {
-    openFirefoxShareModal();
-    return;
-  }
-
-  const wantAudio = fromFirefoxModal
-    ? Boolean(!dom.chkFirefoxIncludeAudio || dom.chkFirefoxIncludeAudio.checked)
-    : quality.audioSource !== 'none';
-
-  // IMPORTANTE PARA FIREFOX:
-  // No Firefox, o gesto de clique (userActivation) expira enquanto o usuário escolhe a janela no getDisplayMedia.
-  // Por isso, se ainda não temos um stream de áudio extra autorizado, disparamos a promessa do getUserMedia
-  // SINCRONAMENTE no mesmo milissegundo do clique (antes do await getDisplayMedia)!
+  // Se o usuário estiver no Firefox (que não tem áudio no getDisplayMedia) ou pediu um dispositivo específico,
+  // disparamos o pedido de permissão de áudio no mesmo clique sem abrir nenhum modal extra
   let parallelAudioPromise = null;
-  const hasPreAuthorizedAudio =
-    state.localExtraAudioStream &&
-    state.localExtraAudioStream.active &&
-    state.localExtraAudioStream.getAudioTracks().length > 0;
-
   if (
     wantAudio &&
-    !hasPreAuthorizedAudio &&
     navigator.mediaDevices.getUserMedia &&
     (isFirefoxBrowser ||
       quality.audioSource === 'device-default' ||
@@ -1284,19 +812,12 @@ async function startScreenShare(fromFirefoxModal = false) {
       noiseSuppression: false,
       autoGainControl: false
     };
-
-    if (fromFirefoxModal && dom.selectFirefoxAudioDevice && dom.selectFirefoxAudioDevice.value !== 'default') {
-      audioConstraints.deviceId = { exact: dom.selectFirefoxAudioDevice.value };
-    } else if (quality.audioSource.startsWith('device:')) {
+    if (quality.audioSource.startsWith('device:')) {
       audioConstraints.deviceId = { exact: quality.audioSource.slice('device:'.length) };
     }
-
     parallelAudioPromise = navigator.mediaDevices
       .getUserMedia({ audio: audioConstraints })
-      .catch((err) => {
-        console.warn('[Parallel Audio Request]:', err);
-        return null;
-      });
+      .catch(() => null);
   }
 
   const displayPromise = navigator.mediaDevices.getDisplayMedia({
@@ -1331,32 +852,17 @@ async function startScreenShare(fromFirefoxModal = false) {
     return;
   }
 
-  if (dom.firefoxShareModal) {
-    dom.firefoxShareModal.classList.add('hidden');
-  }
-  stopVuMeter();
-
-  // 1. Se já tínhamos áudio autorizado no Assistente Firefox, anexamos ao stream da tela
-  if (wantAudio && hasPreAuthorizedAudio) {
-    for (const aTrack of state.localExtraAudioStream.getAudioTracks()) {
-      if (!screenStream.getAudioTracks().some((t) => t.id === aTrack.id)) {
-        screenStream.addTrack(aTrack);
-      }
-    }
-  }
-
-  // 2. Se disparamos o pedido de áudio em paralelo no mesmo clique, aguardamos ele agora
   if (wantAudio && parallelAudioPromise) {
-    const parallelAudioStream = await parallelAudioPromise;
-    if (parallelAudioStream && parallelAudioStream.getAudioTracks().length > 0) {
-      state.localExtraAudioStream = parallelAudioStream;
+    const extraAudioStream = await parallelAudioPromise;
+    if (extraAudioStream && extraAudioStream.getAudioTracks().length > 0) {
+      state.localExtraAudioStream = extraAudioStream;
       if (quality.audioSource !== 'auto') {
         for (const oldAudio of screenStream.getAudioTracks()) {
           screenStream.removeTrack(oldAudio);
           oldAudio.stop();
         }
       }
-      for (const aTrack of parallelAudioStream.getAudioTracks()) {
+      for (const aTrack of extraAudioStream.getAudioTracks()) {
         if (!screenStream.getAudioTracks().some((t) => t.id === aTrack.id)) {
           screenStream.addTrack(aTrack);
         }
@@ -1365,82 +871,11 @@ async function startScreenShare(fromFirefoxModal = false) {
     }
   }
 
-  // 3. Caso o navegador ainda não tenha trilha de áudio (ex: Chrome/Edge compartilhando Janela sem áudio do sistema),
-  // tenta pedir o dispositivo de áudio padrão como fallback final
-  if (wantAudio && screenStream.getAudioTracks().length === 0 && navigator.mediaDevices.getUserMedia && !parallelAudioPromise) {
-    try {
-      const fallbackAudio = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        }
-      });
-      state.localExtraAudioStream = fallbackAudio;
-      for (const aTrack of fallbackAudio.getAudioTracks()) {
-        screenStream.addTrack(aTrack);
-      }
-    } catch {}
-  }
-
-  await finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio);
-}
-
-// Permite no Firefox (ou qualquer navegador) transmitir um Arquivo de Vídeo/Filme do PC
-// com Áudio Estéreo 100% Digital Nativo sem precisar de Mixagem Estéreo!
-async function startLocalVideoFileShare(file) {
-  if (!file) return;
-  unlockGlobalAudioPlayback();
-
-  if (state.isSharing) {
-    await stopScreenShare();
-  }
-
-  const quality = getSelectedQualityConfig();
-  state.localQuality = quality;
-
-  const fileUrl = URL.createObjectURL(file);
-  const fileVideo = document.createElement('video');
-  fileVideo.src = fileUrl;
-  fileVideo.loop = true;
-  fileVideo.muted = false;
-  fileVideo.volume = 1.0;
-  fileVideo.playsInline = true;
-  fileVideo.controls = true;
-  state.localFileVideoEl = fileVideo;
-
-  try {
-    await fileVideo.play();
-  } catch (err) {
-    showToast('Erro ao reproduzir o arquivo de vídeo selecionado.');
-    return;
-  }
-
-  const captureFn =
-    fileVideo.captureStream || fileVideo.mozCaptureStream || fileVideo.webkitCaptureStream;
-  if (!captureFn) {
-    showToast('Seu navegador não suporta captura direta de arquivo de vídeo.');
-    return;
-  }
-
-  const capturedStream = captureFn.call(fileVideo);
-  if (dom.firefoxShareModal) {
-    dom.firefoxShareModal.classList.add('hidden');
-  }
-  stopVuMeter();
-
-  await finalizeAndAnnounceLocalStream(capturedStream, quality, true);
-}
-
-async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) {
   const capturedAudioCount = screenStream.getAudioTracks().length;
-  if (wantAudio && capturedAudioCount === 0) {
-    showToast(
-      'Transmissão iniciada SEM áudio! Clique no botão "➕ Ativar Áudio na Transmissão" abaixo do seu vídeo para ligar o som.',
-      8000
-    );
-  } else if (capturedAudioCount > 0) {
-    showToast('Transmissão iniciada com Vídeo 1080p60 + Áudio Estéreo Ativo!');
+  if (capturedAudioCount > 0) {
+    showToast('Transmissão 1080p60 iniciada com Áudio! (Você está Auto-Mutado para não se ouvir)');
+  } else {
+    showToast('Transmissão 1080p60 iniciada (Apenas Vídeo).');
   }
 
   state.localScreenStream = screenStream;
@@ -1448,6 +883,8 @@ async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) 
   const streamId = `stream-${state.peerId}`;
 
   const videoTrack = screenStream.getVideoTracks()[0];
+  const localAudioTrack = screenStream.getAudioTracks()[0] || null;
+
   if (videoTrack) {
     try {
       await videoTrack.applyConstraints({
@@ -1457,8 +894,6 @@ async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) 
       });
     } catch {}
 
-    // Nota: Não definir contentHint = 'motion' em captura de tela no Chromium,
-    // pois faz o navegador ativar downscale automático para 1280x720.
     try {
       videoTrack.contentHint = quality.contentHint === 'detail' ? 'detail' : '';
     } catch {}
@@ -1481,7 +916,7 @@ async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) 
     displayName: `${state.displayName} (Você)`,
     isLocal: true,
     videoTrack,
-    audioTrack: null,
+    audioTrack: localAudioTrack,
     meta
   });
 
@@ -1496,14 +931,6 @@ async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) 
 async function stopScreenShare() {
   const streamId = `stream-${state.peerId}`;
   state.isSharing = false;
-  stopVuMeter();
-
-  for (const rec of state.wsRelayRecorders.values()) {
-    try {
-      rec.stop();
-    } catch {}
-  }
-  state.wsRelayRecorders.clear();
 
   for (const senderObj of state.p2pSenders.values()) {
     try {
@@ -1511,14 +938,6 @@ async function stopScreenShare() {
     } catch {}
   }
   state.p2pSenders.clear();
-
-  if (state.localFileVideoEl) {
-    try {
-      state.localFileVideoEl.pause();
-      state.localFileVideoEl.src = '';
-    } catch {}
-    state.localFileVideoEl = null;
-  }
 
   if (state.localExtraAudioStream) {
     for (const t of state.localExtraAudioStream.getTracks()) {
@@ -1570,18 +989,19 @@ function handleRemoteProducerClosed({ streamId, peerId }) {
 }
 
 // ============================================================================
-// REPRODUÇÃO DE VÍDEO + ÁUDIO COM TRATAMENTO UNIVERSAL DE AUTOPLAY
+// REPRODUÇÃO DE VÍDEO + ÁUDIO COM TRATAMENTO DE AUTOPLAY E AUTO-MUTE LOCAL
 // ============================================================================
 function tryPlayRemoteVideoWithAudio(entry) {
   if (!entry || !entry.videoEl) return;
 
+  // Quem está compartilhando a tela começa AUTO-MUTADO por padrão (userManuallyMuted = true)
+  // Só reproduz o próprio áudio se a própria pessoa clicar para se desmutar!
   if (entry.isLocal) {
-    entry.videoEl.muted = true;
+    entry.videoEl.muted = Boolean(entry.userManuallyMuted);
     entry.videoEl.play().catch(() => {});
     return;
   }
 
-  // Se o espectador não mutou manualmente, tentamos tocar COM SOM direto no elemento <video>
   if (!entry.userManuallyMuted) {
     entry.videoEl.muted = false;
   }
@@ -1594,8 +1014,6 @@ function tryPlayRemoteVideoWithAudio(entry) {
       }
     })
     .catch(() => {
-      // O navegador (Firefox / Safari / Mobile) bloqueou Autoplay com som sem clique prévio:
-      // Iniciamos o vídeo mutado para não congelar a imagem e exibimos o botão "Ativar Som"!
       entry.videoEl.muted = true;
       entry.videoEl.play().catch(() => {});
       if (entry.unlockBannerEl && (entry.audioTrack || entry.meta?.hasAudio)) {
@@ -1620,13 +1038,14 @@ function updateAudioBadgeUI(entry) {
 }
 
 // ============================================================================
-// GERENCIAMENTO DO PALCO E MOSAICO DE VÍDEOS + VOLUME INDIVIDUAL
+// GERENCIAMENTO DO PALCO E MOSAICO + LIP-SYNC + AUTO-MUTE DO TRANSMISSOR
 // ============================================================================
 function upsertStreamTile({
   streamId,
   peerId,
   displayName,
   isLocal,
+  remoteStream,
   videoTrack,
   audioTrack,
   p2pPc,
@@ -1640,13 +1059,13 @@ function upsertStreamTile({
       peerId,
       displayName,
       isLocal,
-      mediaStream: new MediaStream(),
+      mediaStream: remoteStream || new MediaStream(),
       videoTrack: null,
       audioTrack: null,
       p2pPc: null,
-      usingWsRelay: false,
-      wsRelayBytes: 0,
-      userManuallyMuted: false,
+      // POR PADRÃO: Quem compartilha a tela começa AUTO-MUTADO (true) para nunca se ouvir sem querer!
+      // Os espectadores começam desmutados (false) para ouvirem a transmissão.
+      userManuallyMuted: Boolean(isLocal),
       meta: meta || {},
       prevBytes: 0,
       prevTimestamp: 0,
@@ -1654,6 +1073,7 @@ function upsertStreamTile({
       videoEl: null,
       unlockBannerEl: null,
       muteBtnEl: null,
+      volSliderEl: null,
       resBadgeEl: null,
       bitrateBadgeEl: null,
       codecBadgeEl: null,
@@ -1675,19 +1095,31 @@ function upsertStreamTile({
     dom.streamsGrid.appendChild(entry.cardEl);
   }
 
-  if (videoTrack && !entry.usingWsRelay) {
-    for (const old of entry.mediaStream.getVideoTracks()) {
-      if (old.id !== videoTrack.id) {
-        entry.mediaStream.removeTrack(old);
+  if (videoTrack) {
+    entry.videoTrack = videoTrack;
+  }
+  if (audioTrack) {
+    entry.audioTrack = audioTrack;
+    entry.meta.hasAudio = true;
+  }
+
+  // PARA ESPECTADORES REMOTOS:
+  // Usamos diretamente o MediaStream nativo do WebRTC (remoteStream = ev.streams[0])
+  // sem zerar o srcObject, preservando o relógio RTCP Lip-Sync (áudio e vídeo 100% sincronizados)!
+  if (!isLocal) {
+    if (remoteStream && entry.mediaStream !== remoteStream) {
+      entry.mediaStream = remoteStream;
+    } else {
+      if (videoTrack && !entry.mediaStream.getVideoTracks().some((t) => t.id === videoTrack.id)) {
+        entry.mediaStream.addTrack(videoTrack);
+      }
+      if (audioTrack && !entry.mediaStream.getAudioTracks().some((t) => t.id === audioTrack.id)) {
+        entry.mediaStream.addTrack(audioTrack);
       }
     }
-    if (!entry.mediaStream.getVideoTracks().some((t) => t.id === videoTrack.id)) {
-      entry.mediaStream.addTrack(videoTrack);
-    }
-    entry.videoTrack = videoTrack;
 
-    const attachAndPlay = () => {
-      if (entry.videoEl && !entry.usingWsRelay) {
+    const attachRemote = () => {
+      if (entry.videoEl) {
         if (entry.videoEl.srcObject !== entry.mediaStream) {
           entry.videoEl.srcObject = entry.mediaStream;
         }
@@ -1695,34 +1127,17 @@ function upsertStreamTile({
       }
     };
 
-    attachAndPlay();
-    videoTrack.onunmute = attachAndPlay;
-  }
-
-  // Adicionamos a trilha de áudio DIRETAMENTE ao mesmo MediaStream do <video>
-  // para máxima compatibilidade com Firefox, Chrome, Safari e Mobile!
-  if (audioTrack && !isLocal && !entry.usingWsRelay) {
-    for (const old of entry.mediaStream.getAudioTracks()) {
-      if (old.id !== audioTrack.id) {
-        entry.mediaStream.removeTrack(old);
-      }
+    attachRemote();
+    if (videoTrack) videoTrack.onunmute = attachRemote;
+    if (audioTrack) audioTrack.onunmute = attachRemote;
+  } else {
+    // PARA QUEM ESTÁ COMPARTILHANDO A TELA (isLocal === true):
+    // Enquanto estiver Auto-Mutado (padrão), só colocamos o vídeo na prévia local (zero eco/retorno!).
+    // Se a pessoa clicar para se desmutar, aí sim acoplamos o áudio na prévia local.
+    if (videoTrack && !entry.mediaStream.getVideoTracks().some((t) => t.id === videoTrack.id)) {
+      entry.mediaStream.addTrack(videoTrack);
     }
-    if (!entry.mediaStream.getAudioTracks().some((t) => t.id === audioTrack.id)) {
-      entry.mediaStream.addTrack(audioTrack);
-    }
-    entry.audioTrack = audioTrack;
-    entry.meta.hasAudio = true;
-
-    const attachAndPlayAudio = () => {
-      if (entry.videoEl && !entry.usingWsRelay) {
-        entry.videoEl.srcObject = null;
-        entry.videoEl.srcObject = entry.mediaStream;
-        tryPlayRemoteVideoWithAudio(entry);
-      }
-    };
-
-    attachAndPlayAudio();
-    audioTrack.onunmute = attachAndPlayAudio;
+    syncLocalPreviewSelfMuteState(entry);
   }
 
   updateAudioBadgeUI(entry);
@@ -1735,6 +1150,32 @@ function upsertStreamTile({
   return entry;
 }
 
+function syncLocalPreviewSelfMuteState(entry) {
+  if (!entry || !entry.isLocal || !entry.videoEl) return;
+
+  if (entry.userManuallyMuted) {
+    // Remove qualquer trilha de áudio do reprodutor local para ser fisicamente impossível se ouvir
+    for (const aTrack of entry.mediaStream.getAudioTracks()) {
+      entry.mediaStream.removeTrack(aTrack);
+    }
+    entry.videoEl.muted = true;
+  } else {
+    // Usuário escolheu explicitamente se desmutar para ouvir a própria transmissão
+    if (
+      entry.audioTrack &&
+      !entry.mediaStream.getAudioTracks().some((t) => t.id === entry.audioTrack.id)
+    ) {
+      entry.mediaStream.addTrack(entry.audioTrack);
+    }
+    entry.videoEl.muted = false;
+  }
+
+  if (entry.videoEl.srcObject !== entry.mediaStream) {
+    entry.videoEl.srcObject = entry.mediaStream;
+  }
+  entry.videoEl.play().catch(() => {});
+}
+
 function createStreamCardDOM(entry) {
   const card = document.createElement('div');
   card.className = 'stream-card';
@@ -1744,11 +1185,12 @@ function createStreamCardDOM(entry) {
   video.className = 'stream-video';
   video.autoplay = true;
   video.playsInline = true;
+  // Se for a própria transmissão (isLocal), inicia 100% mutado e volume 0 por padrão
   video.muted = Boolean(entry.isLocal);
-  video.volume = 1.0;
+  video.volume = entry.isLocal ? 0 : 1.0;
   entry.videoEl = video;
 
-  // Banner clicável caso o navegador bloqueie Autoplay de som antes do clique do usuário
+  // Banner clicável caso o navegador bloqueie Autoplay de som em transmissões de amigos
   const unlockBanner = document.createElement('button');
   unlockBanner.type = 'button';
   unlockBanner.className = 'audio-unlock-banner hidden';
@@ -1810,46 +1252,41 @@ function createStreamCardDOM(entry) {
   const audioControls = document.createElement('div');
   audioControls.className = 'audio-controls';
 
-  if (entry.isLocal) {
-    const hasAudioNow = Boolean(entry.meta?.hasAudio);
-    const liveAudioBtn = document.createElement('button');
-    liveAudioBtn.type = 'button';
-    liveAudioBtn.className = hasAudioNow
-      ? 'btn-stream-ctrl'
-      : 'btn-stream-ctrl btn-add-audio-live';
-    liveAudioBtn.textContent = hasAudioNow
-      ? '🎤 Trocar Fonte de Áudio'
-      : '➕ Ativar Áudio na Transmissão';
-    liveAudioBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      attachLiveAudioToActiveStream();
-    });
-    entry.liveAudioBtnEl = liveAudioBtn;
+  const muteBtn = document.createElement('button');
+  muteBtn.type = 'button';
+  muteBtn.className = 'btn-stream-ctrl';
+  muteBtn.textContent = entry.isLocal
+    ? '🔇 Auto-Mutado (Clique para se ouvir)'
+    : 'Som Ativo';
+  entry.muteBtnEl = muteBtn;
 
-    const selfLabel = document.createElement('span');
-    selfLabel.className = 'mono-label';
-    selfLabel.style.color = '#a1a1aa';
-    selfLabel.textContent = 'Sua transmissão (Áudio local silenciado para evitar eco)';
-    audioControls.append(liveAudioBtn, selfLabel);
-  } else {
-    const muteBtn = document.createElement('button');
-    muteBtn.type = 'button';
-    muteBtn.className = 'btn-stream-ctrl';
-    muteBtn.textContent = 'Som Ativo';
-    entry.muteBtnEl = muteBtn;
+  const volSlider = document.createElement('input');
+  volSlider.type = 'range';
+  volSlider.className = 'volume-slider';
+  volSlider.min = '0';
+  volSlider.max = '100';
+  volSlider.value = entry.isLocal ? '0' : '100';
+  entry.volSliderEl = volSlider;
 
-    const volSlider = document.createElement('input');
-    volSlider.type = 'range';
-    volSlider.className = 'volume-slider';
-    volSlider.min = '0';
-    volSlider.max = '100';
-    volSlider.value = '100';
+  muteBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    unlockGlobalAudioPlayback();
 
-    muteBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      unlockGlobalAudioPlayback();
-      video.muted = !video.muted;
-      entry.userManuallyMuted = video.muted;
+    entry.userManuallyMuted = !entry.userManuallyMuted;
+
+    if (entry.isLocal) {
+      if (!entry.userManuallyMuted && video.volume === 0) {
+        video.volume = 1.0;
+        volSlider.value = '100';
+      } else if (entry.userManuallyMuted) {
+        volSlider.value = '0';
+      }
+      syncLocalPreviewSelfMuteState(entry);
+      muteBtn.textContent = entry.userManuallyMuted
+        ? '🔇 Auto-Mutado (Clique para se ouvir)'
+        : '🔊 Ouvindo Própria Tela';
+    } else {
+      video.muted = entry.userManuallyMuted;
       muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
       if (!video.muted) {
         if (video.volume === 0) {
@@ -1859,24 +1296,32 @@ function createStreamCardDOM(entry) {
         unlockBanner.classList.add('hidden');
         video.play().catch(() => {});
       }
-    });
+    }
+  });
 
-    volSlider.addEventListener('input', (e) => {
-      e.stopPropagation();
-      unlockGlobalAudioPlayback();
-      const val = parseInt(e.target.value, 10) / 100;
-      video.volume = val;
+  volSlider.addEventListener('input', (e) => {
+    e.stopPropagation();
+    unlockGlobalAudioPlayback();
+    const val = parseInt(e.target.value, 10) / 100;
+    video.volume = val;
+    entry.userManuallyMuted = val === 0;
+
+    if (entry.isLocal) {
+      syncLocalPreviewSelfMuteState(entry);
+      muteBtn.textContent = entry.userManuallyMuted
+        ? '🔇 Auto-Mutado (Clique para se ouvir)'
+        : '🔊 Ouvindo Própria Tela';
+    } else {
       video.muted = val === 0;
-      entry.userManuallyMuted = video.muted;
       muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
       if (!video.muted) {
         unlockBanner.classList.add('hidden');
         video.play().catch(() => {});
       }
-    });
+    }
+  });
 
-    audioControls.append(muteBtn, volSlider);
-  }
+  audioControls.append(muteBtn, volSlider);
 
   const actionsRight = document.createElement('div');
   actionsRight.className = 'stream-actions-right';
@@ -1939,10 +1384,6 @@ function removeStreamTile(streamId) {
   const entry = state.streams.get(streamId);
   if (!entry) return;
 
-  if (entry.fallbackTimer) {
-    clearTimeout(entry.fallbackTimer);
-  }
-
   if (entry.cardEl) {
     entry.cardEl.remove();
   }
@@ -1998,28 +1439,6 @@ function startTelemetryLoop() {
   state.statsInterval = setInterval(async () => {
     for (const entry of state.streams.values()) {
       try {
-        if (entry.usingWsRelay) {
-          const now = performance.now();
-          const bytes = entry.wsRelayBytes || 0;
-          if (entry.prevTimestamp > 0 && now > entry.prevTimestamp) {
-            const deltaBytes = bytes - entry.prevBytes;
-            const deltaSec = (now - entry.prevTimestamp) / 1000;
-            if (deltaSec > 0 && deltaBytes >= 0 && entry.bitrateBadgeEl) {
-              const mbps = ((deltaBytes * 8) / (deltaSec * 1000000)).toFixed(1);
-              entry.bitrateBadgeEl.textContent = `${mbps} Mbps`;
-            }
-          }
-          entry.prevBytes = bytes;
-          entry.prevTimestamp = now;
-          if (entry.videoEl && entry.videoEl.videoWidth > 0 && entry.resBadgeEl) {
-            entry.resBadgeEl.textContent = `${entry.videoEl.videoWidth}×${entry.videoEl.videoHeight} · 60 FPS`;
-          }
-          if (entry.codecBadgeEl) {
-            entry.codecBadgeEl.textContent = 'TUNNEL';
-          }
-          continue;
-        }
-
         let targetPc = entry.p2pPc;
         if (entry.isLocal) {
           const firstSender = state.p2pSenders.values().next().value;
@@ -2077,7 +1496,7 @@ function startTelemetryLoop() {
         }
       } catch {}
     }
-  }, 1200);
+  }, 1500);
 }
 
 // ============================================================================
@@ -2168,54 +1587,6 @@ if (dom.btnDetectAudioDevices) {
   dom.btnDetectAudioDevices.addEventListener('click', (e) => {
     e.stopPropagation();
     requestAndPopulateAudioDevices(true);
-  });
-}
-
-if (dom.btnCloseFirefoxModal) {
-  dom.btnCloseFirefoxModal.addEventListener('click', () => {
-    dom.firefoxShareModal.classList.add('hidden');
-    stopVuMeter();
-  });
-}
-
-if (dom.chkFirefoxIncludeAudio && dom.firefoxAudioConfigArea) {
-  dom.chkFirefoxIncludeAudio.addEventListener('change', () => {
-    dom.firefoxAudioConfigArea.style.display = dom.chkFirefoxIncludeAudio.checked
-      ? 'flex'
-      : 'none';
-  });
-}
-
-if (dom.btnFirefoxTestAudio) {
-  dom.btnFirefoxTestAudio.addEventListener('click', () => {
-    authorizeAndPreviewFirefoxAudio();
-  });
-}
-
-if (dom.selectFirefoxAudioDevice) {
-  dom.selectFirefoxAudioDevice.addEventListener('change', () => {
-    if (state.localExtraAudioStream) {
-      authorizeAndPreviewFirefoxAudio();
-    }
-  });
-}
-
-if (dom.btnFirefoxStartShare) {
-  dom.btnFirefoxStartShare.addEventListener('click', () => {
-    startScreenShare(true);
-  });
-}
-
-if (dom.btnFirefoxShareFile && dom.inputLocalVideoFile) {
-  dom.btnFirefoxShareFile.addEventListener('click', () => {
-    dom.inputLocalVideoFile.value = '';
-    dom.inputLocalVideoFile.click();
-  });
-  dom.inputLocalVideoFile.addEventListener('change', (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (file) {
-      startLocalVideoFileShare(file);
-    }
   });
 }
 
