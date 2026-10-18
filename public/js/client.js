@@ -136,57 +136,6 @@ function unlockGlobalAudioPlayback() {
 document.addEventListener('click', unlockGlobalAudioPlayback, { passive: true });
 
 // ============================================================================
-// LISTAGEM E AUTORIZAÇÃO DE DISPOSITIVOS DE ÁUDIO (FIREFOX / QUALQUER PC)
-// ============================================================================
-async function requestAndPopulateAudioDevices(showPrompt = false) {
-  if (!navigator.mediaDevices) return;
-
-  if (showPrompt && navigator.mediaDevices.getUserMedia) {
-    try {
-      const tempStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        }
-      });
-      for (const t of tempStream.getTracks()) {
-        t.stop();
-      }
-      showToast('Permissão de áudio concedida! Dispositivos carregados.');
-    } catch {
-      showToast('Permissão de áudio negada ou nenhum dispositivo encontrado.');
-      return;
-    }
-  }
-
-  if (!navigator.mediaDevices.enumerateDevices || !dom.selectAudioSource) return;
-
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const audioInputs = devices.filter((d) => d.kind === 'audioinput');
-
-    const currentVal = dom.selectAudioSource.value;
-    dom.selectAudioSource.innerHTML = `
-      <option value="auto">Automático (Áudio da Tela + Fallback Firefox/Dispositivo)</option>
-      <option value="device-default">Pedir Permissão de Áudio (Microfone / Mixagem Estéreo)</option>
-      <option value="none">Sem Áudio (Apenas Vídeo)</option>
-    `;
-
-    audioInputs.forEach((dev, idx) => {
-      const opt = document.createElement('option');
-      opt.value = `device:${dev.deviceId}`;
-      opt.textContent = `Dispositivo: ${dev.label || `Entrada de Áudio #${idx + 1}`}`;
-      dom.selectAudioSource.appendChild(opt);
-    });
-
-    if ([...dom.selectAudioSource.options].some((o) => o.value === currentVal)) {
-      dom.selectAudioSource.value = currentVal;
-    }
-  } catch {}
-}
-
-// ============================================================================
 // UTILITÁRIOS E NOTIFICAÇÕES
 // ============================================================================
 function showToast(message, durationMs = 4000) {
@@ -218,7 +167,7 @@ function getSelectedQualityConfig() {
     height = 720;
   }
 
-  const bitrateMbps = parseInt(dom.selectBitrate.value || '12', 10);
+  const bitrateMbps = parseInt(dom.selectBitrate.value || '6', 10);
   const codec = dom.selectCodec.value || 'H264';
   const contentHint = dom.selectContentHint.value || 'motion';
   const audioSource = dom.selectAudioSource ? dom.selectAudioSource.value : 'auto';
@@ -260,18 +209,9 @@ async function applyHighQualitySenderParams(pc, quality) {
   for (const sender of pc.getSenders()) {
     if (!sender.track) continue;
 
-    if (sender.track.kind === 'audio') {
-      try {
-        const aParams = sender.getParameters();
-        if (!aParams.encodings || aParams.encodings.length === 0) {
-          aParams.encodings = [{}];
-        }
-        // Prioridade máxima para os pacotes de áudio na rede para nunca atrasarem atrás do vídeo 1080p60
-        aParams.encodings[0].priority = 'high';
-        aParams.encodings[0].networkPriority = 'high';
-        await sender.setParameters(aParams);
-      } catch {}
-    } else if (sender.track.kind === 'video') {
+    // IMPORTANTE: Não separamos a prioridade de rede do áudio em relação ao vídeo
+    // para que ambos trafeguem juntos na mesma fila e mantenham sincronia absoluta (Lip-Sync).
+    if (sender.track.kind === 'video') {
       try {
         const params = sender.getParameters();
         if (!params.encodings || params.encodings.length === 0) {
@@ -280,7 +220,7 @@ async function applyHighQualitySenderParams(pc, quality) {
         params.encodings[0].maxBitrate = quality.maxBitrateBps;
         params.encodings[0].maxFramerate = 60;
         params.encodings[0].scaleResolutionDownBy = 1.0;
-        params.degradationPreference = 'maintain-resolution';
+        params.degradationPreference = 'balanced';
         await sender.setParameters(params);
       } catch {}
     }
@@ -335,7 +275,6 @@ async function tryAutoLogin() {
   }
 
   await fetchServerInfo();
-  requestAndPopulateAudioDevices(false);
 
   if (!state.token) return;
 
@@ -688,20 +627,8 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 
       pc.ontrack = (ev) => {
         const track = ev.track;
-        // Usa o MediaStream sincronizado nativo do WebRTC (ev.streams[0]) para manter o Lip-Sync (RTCP SR)
+        // Usa o MediaStream sincronizado nativo do WebRTC (ev.streams[0]) para manter o Lip-Sync exato (RtpStreamsSynchronizer)
         const nativeSyncedStream = ev.streams && ev.streams[0] ? ev.streams[0] : null;
-
-        // Iguala o buffer de recepção de áudio e vídeo para que o vídeo não adiantem em relação ao som
-        try {
-          if (ev.receiver) {
-            if ('playoutDelayHint' in ev.receiver) {
-              ev.receiver.playoutDelayHint = 0.04;
-            }
-            if ('jitterBufferTarget' in ev.receiver) {
-              ev.receiver.jitterBufferTarget = 40;
-            }
-          }
-        } catch {}
 
         upsertStreamTile({
           streamId,
@@ -779,7 +706,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 }
 
 // ============================================================================
-// CAPTURA DIRETA ESTILO DISCORD (1 CLIQUE -> SELETOR NATIVO DE TELA)
+// CAPTURA DIRETA ESTILO DISCORD (1 CLIQUE -> SELETOR NATIVO DE TELA, SEM MICROFONE)
 // ============================================================================
 async function startScreenShare() {
   unlockGlobalAudioPlayback();
@@ -797,85 +724,39 @@ async function startScreenShare() {
   state.localQuality = quality;
   const wantAudio = quality.audioSource !== 'none';
 
-  // Se o usuário estiver no Firefox (que não tem áudio no getDisplayMedia) ou pediu um dispositivo específico,
-  // disparamos o pedido de permissão de áudio no mesmo clique sem abrir nenhum modal extra
-  let parallelAudioPromise = null;
-  if (
-    wantAudio &&
-    navigator.mediaDevices.getUserMedia &&
-    (isFirefoxBrowser ||
-      quality.audioSource === 'device-default' ||
-      quality.audioSource.startsWith('device:'))
-  ) {
-    const audioConstraints = {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false
-    };
-    if (quality.audioSource.startsWith('device:')) {
-      audioConstraints.deviceId = { exact: quality.audioSource.slice('device:'.length) };
-    }
-    parallelAudioPromise = navigator.mediaDevices
-      .getUserMedia({ audio: audioConstraints })
-      .catch(() => null);
-  }
-
-  const displayPromise = navigator.mediaDevices.getDisplayMedia({
-    video: {
-      width: { ideal: quality.width, max: quality.width },
-      height: { ideal: quality.height, max: quality.height },
-      frameRate: { ideal: 60, max: 60 },
-      cursor: 'always'
-    },
-    audio: wantAudio
-      ? {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        }
-      : false,
-    systemAudio: 'include',
-    windowAudio: 'system',
-    surfaceSwitching: 'include',
-    selfBrowserSurface: 'exclude'
-  });
-
+  // IMPORTANTE: Captura EXCLUSIVAMENTE a tela/janela/guia via getDisplayMedia.
+  // NUNCA chama getUserMedia (microfone), evitando qualquer voz duplicada no Discord!
   let screenStream;
   try {
-    screenStream = await displayPromise;
+    screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: quality.width },
+        height: { ideal: quality.height },
+        aspectRatio: { ideal: 16 / 9 },
+        frameRate: { ideal: 60, max: 60 },
+        cursor: 'always'
+      },
+      audio: wantAudio
+        ? {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        : false,
+      systemAudio: 'include',
+      windowAudio: 'system',
+      surfaceSwitching: 'include',
+      selfBrowserSurface: 'exclude'
+    });
   } catch {
-    if (parallelAudioPromise) {
-      parallelAudioPromise.then((s) => {
-        if (s) s.getTracks().forEach((t) => t.stop());
-      });
-    }
     return;
-  }
-
-  if (wantAudio && parallelAudioPromise) {
-    const extraAudioStream = await parallelAudioPromise;
-    if (extraAudioStream && extraAudioStream.getAudioTracks().length > 0) {
-      state.localExtraAudioStream = extraAudioStream;
-      if (quality.audioSource !== 'auto') {
-        for (const oldAudio of screenStream.getAudioTracks()) {
-          screenStream.removeTrack(oldAudio);
-          oldAudio.stop();
-        }
-      }
-      for (const aTrack of extraAudioStream.getAudioTracks()) {
-        if (!screenStream.getAudioTracks().some((t) => t.id === aTrack.id)) {
-          screenStream.addTrack(aTrack);
-        }
-      }
-      requestAndPopulateAudioDevices(false);
-    }
   }
 
   const capturedAudioCount = screenStream.getAudioTracks().length;
   if (capturedAudioCount > 0) {
-    showToast('Transmissão 1080p60 iniciada com Áudio! (Você está Auto-Mutado para não se ouvir)');
+    showToast('Transmissão iniciada com Áudio da Tela! (Você está Auto-Mutado para não se ouvir)');
   } else {
-    showToast('Transmissão 1080p60 iniciada (Apenas Vídeo).');
+    showToast('Transmissão iniciada (Apenas Vídeo).');
   }
 
   state.localScreenStream = screenStream;
@@ -888,8 +769,9 @@ async function startScreenShare() {
   if (videoTrack) {
     try {
       await videoTrack.applyConstraints({
-        width: { ideal: quality.width, max: quality.width },
-        height: { ideal: quality.height, max: quality.height },
+        width: { ideal: quality.width },
+        height: { ideal: quality.height },
+        aspectRatio: { ideal: 16 / 9 },
         frameRate: { ideal: 60, max: 60 }
       });
     } catch {}
@@ -1582,13 +1464,6 @@ dom.btnToggleQuality.addEventListener('click', (e) => {
   dom.membersPopover.classList.add('hidden');
   dom.qualityPopover.classList.toggle('hidden');
 });
-
-if (dom.btnDetectAudioDevices) {
-  dom.btnDetectAudioDevices.addEventListener('click', (e) => {
-    e.stopPropagation();
-    requestAndPopulateAudioDevices(true);
-  });
-}
 
 [dom.selectResolution, dom.selectBitrate, dom.selectCodec, dom.selectContentHint].forEach((sel) => {
   sel.addEventListener('change', updateQualitySummaryPill);

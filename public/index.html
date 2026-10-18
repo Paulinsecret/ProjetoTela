@@ -154,7 +154,7 @@
               <circle cx="12" cy="12" r="3"></circle>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
             </svg>
-            <span id="quality-summary-label">1080p60 · 12M · H264</span>
+            <span id="quality-summary-label">1080p60 · 6M · H264</span>
           </button>
 
           <div id="quality-popover" class="popover-panel popover-right hidden">
@@ -176,10 +176,10 @@
               <div class="setting-row">
                 <label for="select-bitrate" class="setting-label">Bitrate de Vídeo Alvo</label>
                 <select id="select-bitrate" class="setting-select">
-                  <option value="8">8 Mbps (Conexão Moderada)</option>
-                  <option value="12" selected>12 Mbps (Recomendado 1080p60)</option>
-                  <option value="15">15 Mbps (Alta Nitidez / Jogos Rápidos)</option>
-                  <option value="20">20 Mbps (Qualidade Estúdio / LAN)</option>
+                  <option value="4">4 Mbps (Ultra Leve / Zero Delay)</option>
+                  <option value="6" selected>6 Mbps (Recomendado 1080p60 · Sem Delay)</option>
+                  <option value="8">8 Mbps (Alta Nitidez)</option>
+                  <option value="12">12 Mbps (Qualidade Máxima / Fibra Rápida)</option>
                 </select>
               </div>
 
@@ -201,15 +201,11 @@
               </div>
 
               <div class="setting-row">
-                <label for="select-audio-source" class="setting-label">Fonte de Áudio (Firefox / Todos os Dispositivos)</label>
+                <label for="select-audio-source" class="setting-label">Áudio da Transmissão</label>
                 <select id="select-audio-source" class="setting-select">
-                  <option value="auto" selected>Automático (Áudio da Tela + Permissão Firefox/Dispositivo)</option>
-                  <option value="device-default">Forçar Dispositivo de Áudio / Mixagem Estéreo / Mic</option>
+                  <option value="auto" selected>Áudio da Tela / Guia (Nunca usa Microfone)</option>
                   <option value="none">Sem Áudio (Apenas Vídeo)</option>
                 </select>
-                <button type="button" id="btn-detect-audio-devices" class="btn btn-secondary btn-sm" style="margin-top: 6px; width: 100%;">
-                  Autorizar e Listar Dispositivos de Áudio
-                </button>
               </div>
             </div>
           </div>
