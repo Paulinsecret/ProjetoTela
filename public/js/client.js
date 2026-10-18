@@ -1264,9 +1264,8 @@ function upsertStreamTile({
 
     const attachAndPlayAudio = () => {
       if (entry.videoEl && !entry.usingWsRelay) {
-        if (entry.videoEl.srcObject !== entry.mediaStream) {
-          entry.videoEl.srcObject = entry.mediaStream;
-        }
+        entry.videoEl.srcObject = null;
+        entry.videoEl.srcObject = entry.mediaStream;
         tryPlayRemoteVideoWithAudio(entry);
       }
     };
