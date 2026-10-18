@@ -1044,3 +1044,63 @@ body {
     height: 180px;
   }
 }
+
+/* ==========================================================================
+   STATUS DO CARD, AVISO DE CAPTURA DE ÁUDIO E PAINEL DE DIAGNÓSTICO
+   ========================================================================== */
+.stream-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 6;
+  padding: 8px 14px;
+  background-color: rgba(14, 15, 19, 0.88);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: none;
+}
+
+.capture-warning {
+  position: absolute;
+  top: 52px;
+  left: 14px;
+  right: 14px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  background-color: rgba(120, 53, 15, 0.92);
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  border-radius: var(--radius-sm);
+  color: #fef3c7;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.diag-panel {
+  position: absolute;
+  left: 14px;
+  bottom: 52px;
+  z-index: 10;
+  max-width: min(560px, calc(100% - 28px));
+  max-height: calc(100% - 110px);
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background-color: rgba(10, 11, 14, 0.92);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  user-select: text;
+}
+

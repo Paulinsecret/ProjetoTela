@@ -40,6 +40,11 @@ class RoomManager {
     return this.router.rtpCapabilities;
   }
 
+  isCurrentSocket(peerId, ws) {
+    const peer = this.peers.get(peerId);
+    return Boolean(peer && peer.ws === ws);
+  }
+
   addPeer(peerId, displayName, ws) {
     // Se já existir uma conexão antiga do mesmo peerId, limpa antes
     if (this.peers.has(peerId)) {
@@ -75,9 +80,18 @@ class RoomManager {
     return peer.activeStream;
   }
 
-  removePeer(peerId) {
+  removePeer(peerId, expectedWs = null) {
     const peer = this.peers.get(peerId);
     if (!peer) return [];
+    if (expectedWs && peer.ws !== expectedWs) {
+      return [];
+    }
+
+    if (peer.ws && (!expectedWs || peer.ws !== expectedWs)) {
+      try {
+        peer.ws.close(4000, 'Nova sessão iniciada');
+      } catch {}
+    }
 
     const closedProducerIds = [];
     if (peer.activeStream) {

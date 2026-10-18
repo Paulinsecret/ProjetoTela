@@ -113,6 +113,49 @@ app.get('/api/verify', (req, res) => {
   });
 });
 
+// Armazenamento de telemetria e diagnóstico em tempo real (Fase 1)
+const recentDiagEntries = [];
+const MAX_DIAG_ENTRIES = 120;
+
+app.post('/api/diag', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const session = verifySessionToken(token);
+  if (!session) {
+    return res.status(401).json({ ok: false });
+  }
+
+  const entry = {
+    ts: new Date().toISOString(),
+    peerId: session.peerId,
+    displayName: session.displayName,
+    browser: req.body?.browser || '?',
+    kind: req.body?.kind || 'event',
+    data: req.body?.data || {}
+  };
+
+  recentDiagEntries.push(entry);
+  if (recentDiagEntries.length > MAX_DIAG_ENTRIES) {
+    recentDiagEntries.shift();
+  }
+
+  if (entry.kind === 'event') {
+    console.log(
+      `[DIAG][${entry.displayName} · ${entry.browser}]`,
+      JSON.stringify(entry.data)
+    );
+  }
+
+  return res.json({ ok: true });
+});
+
+app.get('/api/diag', (req, res) => {
+  res.json({
+    count: recentDiagEntries.length,
+    entries: recentDiagEntries.slice(-50)
+  });
+});
+
 /**
  * Gera ou carrega um certificado TLS autoassinado local com todos os IPs da máquina
  * para permitir HTTPS direto (porta 3443) em LAN/VPN mesmo sem domínio público.
@@ -173,6 +216,14 @@ function attachWebSocketServer(server) {
     }
 
     const { peerId, displayName } = session;
+
+    // Se o usuário deu F5 e tinha uma transmissão aberta na sessão anterior,
+    // avisa a sala que a transmissão anterior foi encerrada antes de registrar o novo socket
+    const replacedProducers = roomManager.removePeer(peerId);
+    for (const closed of replacedProducers) {
+      roomManager.broadcast('producerClosed', closed, peerId);
+    }
+
     roomManager.addPeer(peerId, displayName, ws);
 
     // Envia estado inicial da sala e transmissões já ativas para quem acabou de entrar
@@ -187,6 +238,8 @@ function attachWebSocketServer(server) {
     roomManager.broadcast('roomState', roomManager.getRoomState());
 
     ws.on('message', async (raw) => {
+      if (!roomManager.isCurrentSocket(peerId, ws)) return;
+
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -353,10 +406,16 @@ function attachWebSocketServer(server) {
     });
 
     ws.on('close', () => {
-      const closedProducers = roomManager.removePeer(peerId);
+      // Se este socket já foi substituído por uma reconexão (ex: F5), ignora o fechamento atrasado!
+      if (!roomManager.isCurrentSocket(peerId, ws)) {
+        return;
+      }
+
+      const closedProducers = roomManager.removePeer(peerId, ws);
       for (const closed of closedProducers) {
         roomManager.broadcast('producerClosed', closed);
       }
+      roomManager.broadcast('peerLeft', { peerId });
       roomManager.broadcast('roomState', roomManager.getRoomState());
     });
   });
@@ -364,6 +423,20 @@ function attachWebSocketServer(server) {
 
 function startCloudflareTunnelIfAvailable() {
   if (process.env.AUTO_TUNNEL === 'false') return;
+  const tunnelFile = path.join(__dirname, '..', 'tunnel.url');
+  if (process.env.REUSE_TUNNEL === 'true' && fs.existsSync(tunnelFile)) {
+    try {
+      const existingUrl = fs.readFileSync(tunnelFile, 'utf8').trim();
+      if (existingUrl) {
+        console.log(`\n========================================================================`);
+        console.log(`[CLOUDFLARE TUNNEL REUTILIZADO] Link HTTPS ativo:`);
+        console.log(`👉  ${existingUrl}`);
+        console.log(`========================================================================\n`);
+        return;
+      }
+    } catch {}
+  }
+
   const binPath = path.join(
     __dirname,
     '..',
@@ -373,7 +446,6 @@ function startCloudflareTunnelIfAvailable() {
   if (!fs.existsSync(binPath)) return;
 
   const { spawn } = require('child_process');
-  const tunnelFile = path.join(__dirname, '..', 'tunnel.url');
   try {
     if (fs.existsSync(tunnelFile)) fs.unlinkSync(tunnelFile);
   } catch {}
