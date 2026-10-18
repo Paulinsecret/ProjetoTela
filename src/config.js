@@ -25,8 +25,14 @@ function getLocalIPv4Addresses() {
  */
 async function resolveToIPv4(hostOrIp) {
   if (!hostOrIp || typeof hostOrIp !== 'string') return null;
-  const clean = hostOrIp.trim().replace(/^\[|\]$/g, '');
+  const clean = hostOrIp.trim().replace(/^\[|\]$/g, '').toLowerCase();
   if (!clean || clean === 'localhost') return '127.0.0.1';
+
+  // Domínios de túnel HTTP da Cloudflare apontam para o proxy HTTP da Cloudflare,
+  // portanto não devem ser resolvidos como IP de mídia UDP local do Mediasoup.
+  if (clean.endsWith('.trycloudflare.com') || clean.endsWith('.cfargotunnel.com')) {
+    return null;
+  }
 
   if (net.isIPv4(clean)) {
     return clean;
@@ -79,13 +85,23 @@ async function resolveListenIps(clientHost) {
 }
 
 /**
- * Lista de servidores ICE (STUN públicos gratuitos + TURN opcional via .env)
+ * Lista de servidores ICE (STUN Cloudflare/Google + TURN de fallback para furar CGNAT no Cloudflare Tunnel)
  */
 function getIceServers() {
   const iceServers = [
+    { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
   ];
 
   if (process.env.TURN_URL) {

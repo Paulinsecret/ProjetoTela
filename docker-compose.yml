@@ -18,6 +18,14 @@ services:
       - "${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}:${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}/udp"
       - "${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}:${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}/tcp"
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: stage-cloudflared-tunnel
+    restart: unless-stopped
+    depends_on:
+      - stage-sfu
+    command: tunnel --no-autoupdate --url http://stage-sfu:3000
+
   caddy:
     image: caddy:2-alpine
     container_name: stage-caddy-https

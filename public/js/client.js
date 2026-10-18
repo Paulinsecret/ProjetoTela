@@ -1,7 +1,7 @@
 import * as mediasoupClient from 'mediasoup-client';
 
 // ============================================================================
-// ESTADO GLOBAL DO CLIENTE
+// ESTADO GLOBAL DO CLIENTE (HÍBRIDO: MEDIASOUP SFU + FULL-ICE CLOUDFLARE TUNNEL)
 // ============================================================================
 const state = {
   token: localStorage.getItem('stage_sfu_token') || null,
@@ -20,19 +20,38 @@ const state = {
   localScreenStream: null,
   localVideoProducer: null,
   localAudioProducer: null,
+  localQuality: null,
+
+  // Conexões Full-ICE WebRTC (NAT Traversal STUN/TURN para Cloudflare Tunnel sem abrir portas no roteador)
+  // Chave: remotePeerId -> RTCPeerConnection
+  p2pSenders: new Map(),
+  p2pReceivers: new Map(),
 
   // Mapa de transmissões ativas na sala: streamId -> StreamEntry
-  // StreamEntry: { streamId, peerId, displayName, isLocal, mediaStream, videoTrack, audioTrack, videoConsumer, audioConsumer, meta, prevBytes, prevTimestamp, cardEl }
   streams: new Map(),
 
-  // Qual stream está em destaque no Modo Palco
   featuredStreamId: null,
   layoutMode: 'stage', // 'stage' | 'mosaic'
 
   pingMs: null,
   pingInterval: null,
   statsInterval: null,
-  localIps: []
+  localIps: [],
+  tunnelUrl: null,
+  iceServers: [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ]
 };
 
 // ============================================================================
@@ -91,6 +110,15 @@ const dom = {
   toastContainer: document.getElementById('toast-container')
 };
 
+function isTunnelHost() {
+  const h = window.location.hostname.toLowerCase();
+  return (
+    h.endsWith('.trycloudflare.com') ||
+    h.endsWith('.cfargotunnel.com') ||
+    (h !== 'localhost' && h !== '127.0.0.1' && !h.startsWith('192.168.') && !h.startsWith('10.') && !h.startsWith('100.') && !h.startsWith('26.'))
+  );
+}
+
 // ============================================================================
 // UTILITÁRIOS E NOTIFICAÇÕES
 // ============================================================================
@@ -139,6 +167,22 @@ function getSelectedQualityConfig() {
   };
 }
 
+/**
+ * Otimiza o SDP para Áudio Estéreo de Jogo em 256kbps (Opus) e Bitrate Alto de Vídeo
+ */
+function enhanceSdpForHighQuality(sdp, bitrateMbps = 12) {
+  let modified = sdp.replace(
+    /a=fmtp:(\d+) minptime=10;useinbandfec=1/g,
+    `a=fmtp:$1 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000;usedtx=0;cbr=1`
+  );
+  const maxKbps = bitrateMbps * 1000;
+  modified = modified.replace(
+    /(m=video .*\r\n)/g,
+    `$1b=AS:${maxKbps}\r\n`
+  );
+  return modified;
+}
+
 // ============================================================================
 // INICIALIZAÇÃO E AUTENTICAÇÃO
 // ============================================================================
@@ -149,6 +193,10 @@ async function fetchServerInfo() {
     const info = await res.json();
     state.serverName = info.serverName || 'STAGE // 1080p60';
     state.localIps = info.localIps || [];
+    state.tunnelUrl = info.tunnelUrl || null;
+    if (Array.isArray(info.iceServers) && info.iceServers.length > 0) {
+      state.iceServers = info.iceServers;
+    }
 
     dom.loginServerName.textContent = state.serverName;
     dom.topbarServerName.textContent = state.serverName;
@@ -159,17 +207,20 @@ async function fetchServerInfo() {
 }
 
 function renderNetworkModalInfo() {
-  dom.currentUrlCode.textContent = window.location.origin;
+  dom.currentUrlCode.textContent = state.tunnelUrl || window.location.origin;
   dom.networkIpsList.innerHTML = '';
 
-  if (!state.localIps || state.localIps.length === 0) {
-    dom.networkIpsList.textContent = 'Nenhum IP de rede adicional detectado.';
-    return;
+  if (state.tunnelUrl) {
+    const cfRow = document.createElement('div');
+    cfRow.style.color = '#10b981';
+    cfRow.style.fontWeight = '600';
+    cfRow.textContent = `Cloudflare Tunnel (HTTPS Público): ${state.tunnelUrl}`;
+    dom.networkIpsList.appendChild(cfRow);
   }
 
-  for (const ip of state.localIps) {
+  for (const ip of state.localIps || []) {
     const row = document.createElement('div');
-    row.textContent = `https://${ip}:8443  (ou https://${ip}:3443)`;
+    row.textContent = `Rede Local / VPN: https://${ip}:3443`;
     dom.networkIpsList.appendChild(row);
   }
 }
@@ -260,7 +311,7 @@ function logout() {
 }
 
 // ============================================================================
-// WEBSOCKET & SINALIZAÇÃO RPC COM O SERVIDOR MEDIASOUP
+// WEBSOCKET & SINALIZAÇÃO RPC COM O SERVIDOR
 // ============================================================================
 function sendRequest(action, data = {}) {
   return new Promise((resolve, reject) => {
@@ -302,7 +353,6 @@ function connectWebSocket() {
       return;
     }
 
-    // Resposta a uma chamada RPC (sendRequest)
     if (msg.id && state.pendingRequests.has(msg.id)) {
       const { resolve, reject } = state.pendingRequests.get(msg.id);
       state.pendingRequests.delete(msg.id);
@@ -311,17 +361,23 @@ function connectWebSocket() {
       return;
     }
 
-    // Eventos enviados pelo servidor
     const { type, data } = msg;
     switch (type) {
       case 'welcome': {
         updateRoomStateUI(data.roomState);
         await initMediasoupDevice();
 
-        // Consome todas as transmissões que já estavam ativas na sala
         if (Array.isArray(data.existingProducers)) {
+          const seenPeers = new Set();
           for (const prod of data.existingProducers) {
-            await consumeRemoteProducer(prod);
+            if (isTunnelHost()) {
+              if (!seenPeers.has(prod.peerId)) {
+                seenPeers.add(prod.peerId);
+                requestFullIceStream(prod.peerId, prod.displayName, prod.meta);
+              }
+            } else {
+              await consumeRemoteProducer(prod);
+            }
           }
         }
         break;
@@ -333,8 +389,21 @@ function connectWebSocket() {
       }
 
       case 'newProducer': {
-        showToast(`${data.displayName} iniciou transmissão` + (data.kind === 'video' ? ' de tela' : ''));
-        await consumeRemoteProducer(data);
+        if (data.kind === 'video') {
+          showToast(`${data.displayName} iniciou transmissão de tela`);
+        }
+        if (isTunnelHost()) {
+          if (data.kind === 'video') {
+            requestFullIceStream(data.peerId, data.displayName, data.meta);
+          }
+        } else {
+          await consumeRemoteProducer(data);
+        }
+        break;
+      }
+
+      case 'p2pSignal': {
+        await handleIncomingP2PSignal(data);
         break;
       }
 
@@ -356,7 +425,6 @@ function connectWebSocket() {
       logout();
       return;
     }
-    // Reconecta automaticamente se cair
     setTimeout(() => {
       if (state.token) connectWebSocket();
     }, 2500);
@@ -379,7 +447,182 @@ function startPingLoop() {
 }
 
 // ============================================================================
-// INICIALIZAÇÃO DO MEDIASOUP DEVICE E TRANSPORTES WEBRTC
+// FULL-ICE WEBRTC (STUN/TURN NAT TRAVERSAL PARA CLOUDFLARE TUNNEL)
+// ============================================================================
+async function requestFullIceStream(streamerPeerId, streamerDisplayName, meta = {}) {
+  if (streamerPeerId === state.peerId) return;
+  await sendRequest('p2pSignal', {
+    targetPeerId: streamerPeerId,
+    signalType: 'request-stream',
+    payload: { meta }
+  });
+}
+
+async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType, payload }) {
+  // 1. Espectador no Cloudflare Tunnel pediu nosso stream -> criamos RTCPeerConnection Full-ICE
+  if (signalType === 'request-stream') {
+    if (!state.localScreenStream) return;
+
+    if (state.p2pSenders.has(fromPeerId)) {
+      try {
+        state.p2pSenders.get(fromPeerId).close();
+      } catch {}
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+    state.p2pSenders.set(fromPeerId, pc);
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        sendRequest('p2pSignal', {
+          targetPeerId: fromPeerId,
+          signalType: 'ice-candidate-from-streamer',
+          payload: { candidate: ev.candidate }
+        }).catch(() => {});
+      }
+    };
+
+    const quality = state.localQuality || getSelectedQualityConfig();
+
+    for (const track of state.localScreenStream.getTracks()) {
+      const sender = pc.addTrack(track, state.localScreenStream);
+
+      if (track.kind === 'video') {
+        try {
+          const transceiver = pc.getTransceivers().find((t) => t.sender === sender);
+          if (transceiver && transceiver.setCodecPreferences && RTCRtpSender.getCapabilities) {
+            const caps = RTCRtpSender.getCapabilities('video');
+            if (caps && caps.codecs) {
+              const preferred = caps.codecs.filter((c) =>
+                c.mimeType.toLowerCase().includes(quality.codec.toLowerCase())
+              );
+              const others = caps.codecs.filter(
+                (c) => !c.mimeType.toLowerCase().includes(quality.codec.toLowerCase())
+              );
+              if (preferred.length > 0) {
+                transceiver.setCodecPreferences([...preferred, ...others]);
+              }
+            }
+          }
+        } catch {}
+
+        setTimeout(async () => {
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+              params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate = quality.maxBitrateBps;
+            params.encodings[0].maxFramerate = 60;
+            params.encodings[0].priority = 'high';
+            params.encodings[0].networkPriority = 'high';
+            params.degradationPreference = 'maintain-framerate';
+            await sender.setParameters(params);
+          } catch {}
+        }, 250);
+      }
+    }
+
+    const offer = await pc.createOffer();
+    offer.sdp = enhanceSdpForHighQuality(offer.sdp, quality.bitrateMbps);
+    await pc.setLocalDescription(offer);
+
+    await sendRequest('p2pSignal', {
+      targetPeerId: fromPeerId,
+      signalType: 'offer',
+      payload: {
+        sdp: pc.localDescription,
+        meta: {
+          resolution: quality.label,
+          bitrateMbps: quality.bitrateMbps,
+          codec: quality.codec
+        }
+      }
+    });
+    return;
+  }
+
+  // 2. Espectador recebeu Offer do Streamer
+  if (signalType === 'offer') {
+    if (state.p2pReceivers.has(fromPeerId)) {
+      try {
+        state.p2pReceivers.get(fromPeerId).close();
+      } catch {}
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+    state.p2pReceivers.set(fromPeerId, pc);
+    const streamId = `stream-${fromPeerId}`;
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        sendRequest('p2pSignal', {
+          targetPeerId: fromPeerId,
+          signalType: 'ice-candidate-from-viewer',
+          payload: { candidate: ev.candidate }
+        }).catch(() => {});
+      }
+    };
+
+    pc.ontrack = (ev) => {
+      const track = ev.track;
+      upsertStreamTile({
+        streamId,
+        peerId: fromPeerId,
+        displayName: fromDisplayName,
+        isLocal: false,
+        videoTrack: track.kind === 'video' ? track : undefined,
+        audioTrack: track.kind === 'audio' ? track : undefined,
+        p2pPc: pc,
+        meta: payload.meta || {}
+      });
+    };
+
+    await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    const answer = await pc.createAnswer();
+    answer.sdp = enhanceSdpForHighQuality(answer.sdp, payload.meta?.bitrateMbps || 12);
+    await pc.setLocalDescription(answer);
+
+    await sendRequest('p2pSignal', {
+      targetPeerId: fromPeerId,
+      signalType: 'answer',
+      payload: { sdp: pc.localDescription }
+    });
+    return;
+  }
+
+  // 3. Streamer recebeu Answer do Espectador
+  if (signalType === 'answer') {
+    const pc = state.p2pSenders.get(fromPeerId);
+    if (pc) {
+      await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    }
+    return;
+  }
+
+  // 4. Candidatos ICE
+  if (signalType === 'ice-candidate-from-streamer') {
+    const pc = state.p2pReceivers.get(fromPeerId);
+    if (pc && payload.candidate) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+      } catch {}
+    }
+    return;
+  }
+
+  if (signalType === 'ice-candidate-from-viewer') {
+    const pc = state.p2pSenders.get(fromPeerId);
+    if (pc && payload.candidate) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+      } catch {}
+    }
+  }
+}
+
+// ============================================================================
+// INICIALIZAÇÃO DO MEDIASOUP DEVICE E TRANSPORTES WEBRTC (SFU)
 // ============================================================================
 async function initMediasoupDevice() {
   const routerRtpCapabilities = await sendRequest('getRouterRtpCapabilities');
@@ -482,6 +725,7 @@ async function startScreenShare() {
   }
 
   const quality = getSelectedQualityConfig();
+  state.localQuality = quality;
 
   let screenStream;
   try {
@@ -505,7 +749,7 @@ async function startScreenShare() {
       selfBrowserSurface: 'exclude'
     });
   } catch {
-    return; // Usuário cancelou a janela de seleção
+    return;
   }
 
   state.localScreenStream = screenStream;
@@ -514,7 +758,6 @@ async function startScreenShare() {
 
   const videoTrack = screenStream.getVideoTracks()[0];
   if (videoTrack) {
-    // Crucial para manter 60 FPS constantes em jogos sem o navegador derrubar quadros
     try {
       videoTrack.contentHint = quality.contentHint;
     } catch {}
@@ -523,7 +766,6 @@ async function startScreenShare() {
       stopScreenShare();
     };
 
-    // Seleciona o codec preferido (H264 NVENC/AMF, VP9 ou VP8)
     const desiredMime = `video/${quality.codec}`;
     const selectedCodec = state.device.rtpCapabilities.codecs.find(
       (c) => c.mimeType.toLowerCase() === desiredMime.toLowerCase()
@@ -561,7 +803,6 @@ async function startScreenShare() {
     state.localVideoProducer = await sendTransport.produce(produceOptions);
   }
 
-  // Captura de áudio estéreo de alta fidelidade (Jogo / Sistema)
   const audioTrack = screenStream.getAudioTracks()[0];
   if (audioTrack) {
     state.localAudioProducer = await sendTransport.produce({
@@ -583,7 +824,6 @@ async function startScreenShare() {
     });
   }
 
-  // Renderiza o preview local na grade/palco (áudio local mutado para não dar eco no próprio PC)
   upsertStreamTile({
     streamId,
     peerId: state.peerId,
@@ -604,6 +844,13 @@ async function startScreenShare() {
 
 async function stopScreenShare() {
   const streamId = `stream-${state.peerId}`;
+
+  for (const pc of state.p2pSenders.values()) {
+    try {
+      pc.close();
+    } catch {}
+  }
+  state.p2pSenders.clear();
 
   if (state.localScreenStream) {
     for (const track of state.localScreenStream.getTracks()) {
@@ -649,7 +896,7 @@ function updateShareButtonUI(isSharing) {
 }
 
 // ============================================================================
-// RECEPÇÃO DE MÚLTIPLAS TRANSMISSÕES DOS AMIGOS (CONSUMERS)
+// RECEPÇÃO DE TRANSMISSÕES VIA SFU (+ FALLBACK AUTOMÁTICO FULL-ICE)
 // ============================================================================
 async function consumeRemoteProducer(producerInfo) {
   if (!state.device) return;
@@ -683,10 +930,35 @@ async function consumeRemoteProducer(producerInfo) {
   });
 
   await sendRequest('resumeConsumer', { consumerId: consumer.id });
+
+  // Se o transporte SFU não conectar em 3s (ex: bloqueio UDP), aciona Full-ICE STUN/TURN
+  if (consumer.kind === 'video') {
+    setTimeout(() => {
+      if (
+        recvTransport.connectionState !== 'connected' &&
+        recvTransport.connectionState !== 'completed'
+      ) {
+        requestFullIceStream(
+          consumerParams.peerId,
+          consumerParams.displayName,
+          consumerParams.meta
+        );
+      }
+    }, 3000);
+  }
 }
 
 function handleRemoteProducerClosed({ producerId, streamId, peerId }) {
   const targetStreamId = streamId || `stream-${peerId}`;
+  if (peerId && state.p2pReceivers.has(peerId)) {
+    try {
+      state.p2pReceivers.get(peerId).close();
+    } catch {}
+    state.p2pReceivers.delete(peerId);
+    removeStreamTile(targetStreamId);
+    return;
+  }
+
   const entry = state.streams.get(targetStreamId);
   if (!entry) return;
 
@@ -723,6 +995,7 @@ function upsertStreamTile({
   audioTrack,
   videoConsumer,
   audioConsumer,
+  p2pPc,
   meta
 }) {
   let entry = state.streams.get(streamId);
@@ -739,6 +1012,7 @@ function upsertStreamTile({
       audioTrack: null,
       videoConsumer: null,
       audioConsumer: null,
+      p2pPc: null,
       meta: meta || {},
       prevBytes: 0,
       prevTimestamp: 0,
@@ -754,6 +1028,10 @@ function upsertStreamTile({
 
   if (meta && Object.keys(meta).length > 0) {
     entry.meta = { ...entry.meta, ...meta };
+  }
+
+  if (p2pPc) {
+    entry.p2pPc = p2pPc;
   }
 
   if (videoTrack) {
@@ -785,7 +1063,7 @@ function upsertStreamTile({
     dom.streamsGrid.appendChild(entry.cardEl);
   }
 
-  if (entry.videoEl && entry.videoEl.srcObject !== entry.mediaStream) {
+  if (entry.videoEl && entry.videoTrack) {
     entry.videoEl.srcObject = entry.mediaStream;
     entry.videoEl.play().catch(() => {});
   }
@@ -811,14 +1089,13 @@ function createStreamCardDOM(entry) {
   video.className = 'stream-video';
   video.autoplay = true;
   video.playsInline = true;
-  video.muted = true; // O áudio roda no elemento <audio> dedicado com controle individual
+  video.muted = true;
   entry.videoEl = video;
 
   const audio = document.createElement('audio');
   audio.autoplay = true;
   entry.audioEl = audio;
 
-  // Barra superior: Nome do Amigo + Indicadores de FPS / Resolução / Bitrate / Codec
   const topOverlay = document.createElement('div');
   topOverlay.className = 'stream-overlay-top';
 
@@ -851,7 +1128,6 @@ function createStreamCardDOM(entry) {
   telemetry.append(resBadge, bitrateBadge, codecBadge);
   topOverlay.append(authorBadge, telemetry);
 
-  // Barra inferior: Volume Individual + Botão Destacar no Palco + PiP + Tela Cheia
   const bottomOverlay = document.createElement('div');
   bottomOverlay.className = 'stream-overlay-bottom';
 
@@ -941,7 +1217,6 @@ function createStreamCardDOM(entry) {
   actionsRight.append(btnFeature, btnPip, btnFullscreen);
   bottomOverlay.append(audioControls, actionsRight);
 
-  // Clicar num card secundário no Modo Palco traz ele para o destaque principal
   card.addEventListener('click', () => {
     if (state.layoutMode === 'stage' && state.featuredStreamId !== entry.streamId) {
       state.featuredStreamId = entry.streamId;
@@ -1012,7 +1287,9 @@ function startTelemetryLoop() {
   state.statsInterval = setInterval(async () => {
     for (const entry of state.streams.values()) {
       try {
-        const targetRtcObj = entry.isLocal ? state.localVideoProducer : entry.videoConsumer;
+        const targetRtcObj = entry.isLocal
+          ? state.localVideoProducer
+          : entry.p2pPc || entry.videoConsumer;
         if (!targetRtcObj || targetRtcObj.closed) continue;
 
         const stats = await targetRtcObj.getStats();
@@ -1084,9 +1361,7 @@ function updateRoomStateUI(roomState) {
     members.length === 1 ? '1 na sala' : `${members.length} na sala`;
   dom.popoverMembersCount.textContent = String(members.length);
 
-  // Atualiza popover do topo
   dom.membersList.innerHTML = '';
-  // Atualiza pílulas do estado vazio
   dom.emptyMembersPills.innerHTML = '';
 
   for (const member of members) {
@@ -1114,7 +1389,6 @@ function updateRoomStateUI(roomState) {
     li.append(info, statusBadge);
     dom.membersList.appendChild(li);
 
-    // Pílula na tela inicial quando não há live
     const pill = document.createElement('div');
     pill.className = 'member-pill';
     pill.innerHTML = `<span class="status-dot status-online"></span><span></span>`;
@@ -1169,7 +1443,7 @@ dom.btnCloseNetworkModal.addEventListener('click', () => {
 });
 
 dom.btnCopyUrl.addEventListener('click', () => {
-  navigator.clipboard.writeText(window.location.origin).then(() => {
+  navigator.clipboard.writeText(dom.currentUrlCode.textContent).then(() => {
     showToast('Link copiado para a área de transferência!');
   });
 });
@@ -1183,6 +1457,5 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// Inicializa na abertura da página
 updateQualitySummaryPill();
 tryAutoLogin();

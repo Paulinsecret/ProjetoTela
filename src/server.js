@@ -47,12 +47,22 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 // Informações públicas da sala para a tela de login e painel de rede
 app.get('/api/info', (req, res) => {
   const roomState = roomManager.getRoomState();
+  let tunnelUrl = process.env.PUBLIC_TUNNEL_URL || null;
+  const tunnelFile = path.join(__dirname, '..', 'tunnel.url');
+  if (!tunnelUrl && fs.existsSync(tunnelFile)) {
+    try {
+      tunnelUrl = fs.readFileSync(tunnelFile, 'utf8').trim() || null;
+    } catch {}
+  }
+
   res.json({
     serverName: config.serverName,
     onlineCount: roomState.members.length,
     activeStreamsCount: roomState.streams.length,
     localIps: config.getLocalIPv4Addresses(),
     announcedIp: process.env.ANNOUNCED_IP || null,
+    tunnelUrl,
+    iceServers: config.getIceServers(),
     rtcPortRange: `${config.mediasoup.worker.rtcMinPort}-${config.mediasoup.worker.rtcMaxPort}`
   });
 });
@@ -298,6 +308,20 @@ function attachWebSocketServer(server) {
             break;
           }
 
+          case 'p2pSignal': {
+            const { targetPeerId, signalType, payload } = data || {};
+            if (targetPeerId) {
+              roomManager.sendToPeer(targetPeerId, 'p2pSignal', {
+                fromPeerId: peerId,
+                fromDisplayName: displayName,
+                signalType,
+                payload
+              });
+            }
+            reply({ sent: true });
+            break;
+          }
+
           default:
             replyError(`Ação desconhecida: ${action}`);
         }
@@ -317,6 +341,53 @@ function attachWebSocketServer(server) {
   });
 }
 
+function startCloudflareTunnelIfAvailable() {
+  if (process.env.AUTO_TUNNEL === 'false') return;
+  const binPath = path.join(
+    __dirname,
+    '..',
+    'bin',
+    process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared'
+  );
+  if (!fs.existsSync(binPath)) return;
+
+  const { spawn } = require('child_process');
+  const tunnelFile = path.join(__dirname, '..', 'tunnel.url');
+  try {
+    if (fs.existsSync(tunnelFile)) fs.unlinkSync(tunnelFile);
+  } catch {}
+
+  const args = process.env.CLOUDFLARE_TUNNEL_TOKEN
+    ? ['tunnel', '--no-autoupdate', 'run', '--token', process.env.CLOUDFLARE_TUNNEL_TOKEN]
+    : ['tunnel', '--no-autoupdate', '--url', `http://localhost:${config.port}`];
+
+  const cf = spawn(binPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const parseChunk = (chunk) => {
+    const text = chunk.toString();
+    const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match && match[0]) {
+      const url = match[0];
+      try {
+        fs.writeFileSync(tunnelFile, url, 'utf8');
+      } catch {}
+      console.log(`\n========================================================================`);
+      console.log(`[CLOUDFLARE TUNNEL ATIVO] Envie este link HTTPS para seus amigos:`);
+      console.log(`👉  ${url}`);
+      console.log(`========================================================================\n`);
+    }
+  };
+
+  cf.stdout.on('data', parseChunk);
+  cf.stderr.on('data', parseChunk);
+
+  process.on('exit', () => {
+    try {
+      cf.kill();
+    } catch {}
+  });
+}
+
 async function startServer() {
   await roomManager.init();
 
@@ -325,6 +396,7 @@ async function startServer() {
 
   httpServer.listen(config.port, '0.0.0.0', () => {
     console.log(`[HTTP]  Servidor rodando em http://localhost:${config.port}`);
+    startCloudflareTunnelIfAvailable();
   });
 
   try {

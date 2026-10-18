@@ -24,3 +24,8 @@ caddy_config/
 Thumbs.db
 .vscode/
 .idea/
+
+# Binários locais auxiliares (cloudflared local)
+bin/
+tunnel.log
+tunnel.url
