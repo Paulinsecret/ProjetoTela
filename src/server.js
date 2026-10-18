@@ -308,6 +308,27 @@ function attachWebSocketServer(server) {
             break;
           }
 
+          case 'announceStream': {
+            const streamInfo = roomManager.setPeerActiveStream(peerId, data || {});
+            reply({ announced: true, streamInfo });
+            if (streamInfo) {
+              roomManager.broadcast(
+                'newProducer',
+                {
+                  producerId: `p2p-${peerId}`,
+                  peerId,
+                  displayName,
+                  kind: 'video',
+                  streamId: streamInfo.streamId,
+                  meta: streamInfo.meta
+                },
+                peerId
+              );
+              roomManager.broadcast('roomState', roomManager.getRoomState());
+            }
+            break;
+          }
+
           case 'p2pSignal': {
             const { targetPeerId, signalType, payload } = data || {};
             if (targetPeerId) {

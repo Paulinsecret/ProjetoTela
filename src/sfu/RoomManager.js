@@ -51,6 +51,7 @@ class RoomManager {
       displayName,
       joinedAt: Date.now(),
       ws,
+      activeStream: null,
       transports: new Map(),
       producers: new Map(),
       consumers: new Map()
@@ -60,11 +61,34 @@ class RoomManager {
     return peer;
   }
 
+  setPeerActiveStream(peerId, streamInfo) {
+    const peer = this.peers.get(peerId);
+    if (!peer) return null;
+    peer.activeStream = streamInfo
+      ? {
+          streamId: streamInfo.streamId || `stream-${peer.id}`,
+          peerId: peer.id,
+          displayName: peer.displayName,
+          meta: streamInfo.meta || {}
+        }
+      : null;
+    return peer.activeStream;
+  }
+
   removePeer(peerId) {
     const peer = this.peers.get(peerId);
     if (!peer) return [];
 
     const closedProducerIds = [];
+    if (peer.activeStream) {
+      closedProducerIds.push({
+        producerId: null,
+        peerId: peer.id,
+        streamId: peer.activeStream.streamId
+      });
+      peer.activeStream = null;
+    }
+
     for (const [producerId, producer] of peer.producers.entries()) {
       closedProducerIds.push({
         producerId,
@@ -97,7 +121,19 @@ class RoomManager {
     const activeStreamsMap = new Map();
 
     for (const peer of this.peers.values()) {
-      let isStreaming = false;
+      let isStreaming = Boolean(peer.activeStream);
+
+      if (peer.activeStream) {
+        activeStreamsMap.set(peer.activeStream.streamId, {
+          streamId: peer.activeStream.streamId,
+          peerId: peer.id,
+          displayName: peer.displayName,
+          hasVideo: true,
+          hasAudio: true,
+          meta: peer.activeStream.meta || {},
+          producers: []
+        });
+      }
 
       for (const producer of peer.producers.values()) {
         if (!producer.closed) {
@@ -149,6 +185,17 @@ class RoomManager {
     const list = [];
     for (const peer of this.peers.values()) {
       if (excludePeerId && peer.id === excludePeerId) continue;
+      if (peer.activeStream) {
+        list.push({
+          producerId: `p2p-${peer.id}`,
+          peerId: peer.id,
+          displayName: peer.displayName,
+          kind: 'video',
+          streamId: peer.activeStream.streamId,
+          meta: peer.activeStream.meta || {}
+        });
+        continue;
+      }
       for (const producer of peer.producers.values()) {
         if (!producer.closed) {
           list.push({
@@ -283,6 +330,15 @@ class RoomManager {
     if (!peer) return [];
 
     const closed = [];
+    if (peer.activeStream) {
+      closed.push({
+        producerId: null,
+        peerId: peer.id,
+        streamId: peer.activeStream.streamId
+      });
+      peer.activeStream = null;
+    }
+
     for (const [producerId, producer] of peer.producers.entries()) {
       const streamId = producer.appData?.streamId || `stream-${peer.id}`;
       try {
