@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STAGE // Compartilhamento de Tela 1080p60</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <!-- ====================================================================
+       TELA DE ACESSO (LOGIN COM SENHA ÚNICA DA SALA)
+       ==================================================================== -->
+  <section id="login-screen" class="login-screen">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="server-badge">
+          <span class="status-dot status-online"></span>
+          <span id="login-server-name" class="mono-label">STAGE // 1080p60</span>
+        </div>
+        <h1 class="login-title">Acesso ao Servidor</h1>
+        <p class="login-subtitle">
+          Transmissão baixa latência via WebRTC SFU em 1080p a 60 FPS.
+        </p>
+      </div>
+
+      <div class="login-stats" id="login-room-summary">
+        <div class="stat-box">
+          <span class="stat-label">Na sala agora</span>
+          <span class="stat-value mono-label" id="login-online-count">0 conectados</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-label">Transmissões</span>
+          <span class="stat-value mono-label" id="login-stream-count">0 ativas</span>
+        </div>
+      </div>
+
+      <form id="login-form" class="login-form" autocomplete="on">
+        <div class="field-group">
+          <label for="input-display-name" class="field-label">Seu Apelido</label>
+          <input
+            type="text"
+            id="input-display-name"
+            class="field-input"
+            placeholder="Ex: Paulo"
+            maxlength="28"
+            required
+            autocomplete="nickname"
+          />
+        </div>
+
+        <div class="field-group">
+          <label for="input-room-password" class="field-label">Senha da Sala</label>
+          <input
+            type="password"
+            id="input-room-password"
+            class="field-input"
+            placeholder="Digite a senha do servidor"
+            required
+            autocomplete="current-password"
+          />
+        </div>
+
+        <div id="login-error" class="form-error hidden"></div>
+
+        <button type="submit" id="btn-login" class="btn btn-primary btn-full">
+          Entrar no Servidor
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ====================================================================
+       APLICAÇÃO PRINCIPAL (SALA DO SERVIDOR)
+       ==================================================================== -->
+  <div id="app-screen" class="app-shell hidden">
+    <!-- BARRA SUPERIOR MINIMALISTA -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand-cluster">
+          <span class="status-dot status-online" id="ws-status-dot"></span>
+          <span class="brand-name" id="topbar-server-name">STAGE // 1080p60</span>
+        </div>
+
+        <div class="divider-v"></div>
+
+        <!-- Indicador de Ping e Telemetria Geral -->
+        <div class="ping-pill mono-label" title="Latência com o servidor SFU">
+          <span>PING</span>
+          <strong id="ping-value">-- ms</strong>
+        </div>
+
+        <!-- Botão/Indicador de Quem Está na Sala -->
+        <div class="members-dropdown-wrapper">
+          <button type="button" id="btn-toggle-members" class="pill-button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+              <circle cx="9" cy="7" r="4"></circle>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+            <span id="members-count-label">1 na sala</span>
+          </button>
+
+          <!-- Popover da Lista de Membros -->
+          <div id="members-popover" class="popover-panel hidden">
+            <div class="popover-header">
+              <span>Participantes Conectados</span>
+              <span id="popover-members-count" class="mono-label">1</span>
+            </div>
+            <ul id="members-list" class="members-list"></ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- CENTRO: Alternador de Layout (Palco vs Mosaico) -->
+      <div class="topbar-center">
+        <div class="layout-switcher" id="layout-switcher">
+          <button
+            type="button"
+            id="btn-mode-stage"
+            class="layout-btn active"
+            title="1 tela em destaque principal e miniaturas das demais"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+            <span>Palco</span>
+          </button>
+          <button
+            type="button"
+            id="btn-mode-mosaic"
+            class="layout-btn"
+            title="Assistir todas as transmissões lado a lado em grade"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7"></rect>
+              <rect x="14" y="3" width="7" height="7"></rect>
+              <rect x="14" y="14" width="7" height="7"></rect>
+              <rect x="3" y="14" width="7" height="7"></rect>
+            </svg>
+            <span>Mosaico</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- DIREITA: Controles de Qualidade (1080p60 / Bitrate / Codec) + Botão Compartilhar Tela -->
+      <div class="topbar-right">
+        <!-- Seletor de Qualidade de Transmissão -->
+        <div class="quality-dropdown-wrapper">
+          <button type="button" id="btn-toggle-quality" class="pill-button mono-label" title="Ajustes de captura (Resolução, Bitrate e Codec)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+            <span id="quality-summary-label">1080p60 · 12M · H264</span>
+          </button>
+
+          <div id="quality-popover" class="popover-panel popover-right hidden">
+            <div class="popover-header">
+              <span>Qualidade da Transmissão</span>
+              <span class="mono-label badge-accent">SFU</span>
+            </div>
+
+            <div class="settings-body">
+              <div class="setting-row">
+                <label for="select-resolution" class="setting-label">Resolução &amp; Taxa de Quadros</label>
+                <select id="select-resolution" class="setting-select">
+                  <option value="1080p60" selected>1080p (1920×1080) @ 60 FPS</option>
+                  <option value="1440p60">1440p (2560×1440) @ 60 FPS</option>
+                  <option value="720p60">720p (1280×720) @ 60 FPS</option>
+                </select>
+              </div>
+
+              <div class="setting-row">
+                <label for="select-bitrate" class="setting-label">Bitrate de Vídeo Alvo</label>
+                <select id="select-bitrate" class="setting-select">
+                  <option value="8">8 Mbps (Conexão Moderada)</option>
+                  <option value="12" selected>12 Mbps (Recomendado 1080p60)</option>
+                  <option value="15">15 Mbps (Alta Nitidez / Jogos Rápidos)</option>
+                  <option value="20">20 Mbps (Qualidade Estúdio / LAN)</option>
+                </select>
+              </div>
+
+              <div class="setting-row">
+                <label for="select-codec" class="setting-label">Codec de Vídeo</label>
+                <select id="select-codec" class="setting-select">
+                  <option value="H264" selected>H.264 (Aceleração GPU NVENC / AMF)</option>
+                  <option value="VP9">VP9 (Alta Eficiência Visual)</option>
+                  <option value="VP8">VP8 (Compatibilidade Universal)</option>
+                </select>
+              </div>
+
+              <div class="setting-row">
+                <label for="select-content-hint" class="setting-label">Otimização de Quadros</label>
+                <select id="select-content-hint" class="setting-select">
+                  <option value="motion" selected>Fluidez 60 FPS (Jogos e Vídeo)</option>
+                  <option value="detail">Nitidez de Texto (Código / Desktop)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Botão de Informações de Conexão / Links pros Amigos -->
+        <button type="button" id="btn-network-info" class="pill-button" title="Como seus amigos se conectam">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="2" y1="12" x2="22" y2="12"></line>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+          </svg>
+          <span>Convidar</span>
+        </button>
+
+        <!-- Botão Principal: Compartilhar Tela -->
+        <button type="button" id="btn-share-screen" class="btn btn-primary">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+          <span id="btn-share-label">Compartilhar Tela</span>
+        </button>
+
+        <!-- Botão Sair -->
+        <button type="button" id="btn-logout" class="btn-icon" title="Sair da sala">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ÁREA PRINCIPAL DO SERVIDOR -->
+    <main class="workspace">
+      <!-- ESTADO VAZIO: Quando ninguém está compartilhando tela no momento -->
+      <section id="empty-stage" class="empty-stage">
+        <div class="empty-stage-card">
+          <div class="empty-icon-box">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+              <path d="M8 21h8"></path>
+              <path d="M12 17v4"></path>
+              <polygon points="10 8 15 10.5 10 13 10 8" fill="currentColor"></polygon>
+            </svg>
+          </div>
+
+          <div class="empty-badge mono-label">SERVIDOR PRONTO · 1080P 60FPS</div>
+          <h2 class="empty-title">Nenhuma transmissão ativa no momento</h2>
+          <p class="empty-description">
+            Compartilhe sua tela inteira ou uma janela específica de jogo com áudio estéreo em alta definição.
+            Mais de uma pessoa pode transmitir simultaneamente.
+          </p>
+
+          <div class="empty-actions">
+            <button type="button" id="btn-empty-share" class="btn btn-primary btn-lg">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+                <line x1="8" y1="21" x2="16" y2="21"></line>
+                <line x1="12" y1="17" x2="12" y2="21"></line>
+              </svg>
+              <span>Compartilhar Tela</span>
+            </button>
+          </div>
+
+          <div class="connected-strip">
+            <span class="connected-strip-label">Conectados no servidor:</span>
+            <div id="empty-members-pills" class="members-pills"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PALCO DE TRANSMISSÕES ATIVAS (Suporta Modo Palco + Modo Mosaico) -->
+      <section id="streams-workspace" class="streams-workspace mode-stage hidden">
+        <!-- Container principal dos cards de vídeo -->
+        <div id="streams-grid" class="streams-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL DE INFORMAÇÕES DE REDE / CONVITE -->
+  <div id="network-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Convidar Amigos para o Servidor</h3>
+        <button type="button" id="btn-close-network-modal" class="btn-icon">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-text">
+          Para que o navegador habilite captura de tela e áudio WebRTC fora do seu computador, seus amigos devem acessar via <strong>HTTPS</strong>.
+        </p>
+
+        <div class="network-block">
+          <span class="network-label">Link Atual Desta Sessão</span>
+          <div class="copy-row">
+            <code id="current-url-code" class="mono-code">https://localhost</code>
+            <button type="button" id="btn-copy-url" class="btn btn-secondary btn-sm">Copiar</button>
+          </div>
+        </div>
+
+        <div class="network-block">
+          <span class="network-label">Endereços Detectados (LAN / Tailscale / Radmin VPN)</span>
+          <div id="network-ips-list" class="ips-list mono-label"></div>
+        </div>
+
+        <div class="network-tips">
+          <div class="tip-item">
+            <strong>1. Via VPN (Tailscale / Radmin / ZeroTier):</strong>
+            <span>Seus amigos conectam na VPN e abrem o link <code>https://SEU_IP_VPN:8443</code> (via Caddy) ou <code>https://SEU_IP_VPN:3443</code>.</span>
+          </div>
+          <div class="tip-item">
+            <strong>2. Via Domínio Gratuito (DuckDNS + Roteador):</strong>
+            <span>Configure <code>CADDY_DOMAIN</code> e <code>ANNOUNCED_IP</code> no arquivo <code>.env</code> e redirecione as portas <code>443</code> e <code>40000-40050/udp</code> no roteador.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificação Toast Discreta -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/dist/bundle.js"></script>
+</body>
+</html>
