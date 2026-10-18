@@ -220,7 +220,8 @@ async function applyHighQualitySenderParams(pc, quality) {
         params.encodings[0].maxBitrate = quality.maxBitrateBps;
         params.encodings[0].maxFramerate = 60;
         params.encodings[0].scaleResolutionDownBy = 1.0;
-        params.degradationPreference = 'balanced';
+        // 'maintain-framerate' garante que quadros de vídeo nunca fiquem na fila de buffer acumulando delay
+        params.degradationPreference = 'maintain-framerate';
         await sender.setParameters(params);
       } catch {}
     }
@@ -627,6 +628,20 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 
       pc.ontrack = (ev) => {
         const track = ev.track;
+
+        if (track.kind === 'video') {
+          try {
+            track.contentHint = 'motion';
+          } catch {}
+        }
+
+        // Força playoutDelayHint = 0 para descarregar o buffer de vídeo imediatamente e zerar o delay em relação ao áudio
+        try {
+          if (ev.receiver && 'playoutDelayHint' in ev.receiver) {
+            ev.receiver.playoutDelayHint = 0;
+          }
+        } catch {}
+
         // Usa o MediaStream sincronizado nativo do WebRTC (ev.streams[0]) para manter o Lip-Sync exato (RtpStreamsSynchronizer)
         const nativeSyncedStream = ev.streams && ev.streams[0] ? ev.streams[0] : null;
 
@@ -777,7 +792,7 @@ async function startScreenShare() {
     } catch {}
 
     try {
-      videoTrack.contentHint = quality.contentHint === 'detail' ? 'detail' : '';
+      videoTrack.contentHint = quality.contentHint === 'detail' ? 'detail' : 'motion';
     } catch {}
 
     videoTrack.onended = () => {
@@ -1002,7 +1017,7 @@ function upsertStreamTile({
 
     const attachRemote = () => {
       if (entry.videoEl) {
-        if (entry.videoEl.srcObject !== entry.mediaStream) {
+        if (entry.videoEl.srcObject !== entry.mediaStream || (entry.videoTrack && entry.audioTrack)) {
           entry.videoEl.srcObject = entry.mediaStream;
         }
         tryPlayRemoteVideoWithAudio(entry);
