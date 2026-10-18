@@ -239,12 +239,49 @@ function getSelectedQualityConfig() {
   };
 }
 
-function enhanceSdpForStereoAudio(sdp) {
+function enhanceSdpForStereoAudio(sdp, bitrateMbps = 12) {
   if (!sdp || typeof sdp !== 'string') return sdp;
-  return sdp.replace(
+
+  // 1. Áudio Opus Estéreo 256kbps
+  let out = sdp.replace(
     /a=fmtp:(\d+) minptime=10;useinbandfec=1/g,
     'a=fmtp:$1 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000;usedtx=0'
   );
+
+  // 2. Desbloqueia o limite do H.264 Level 3.1 (1f = teto de 1280x720@30fps) para Level 4.2 (2a = 1920x1080@60fps)
+  out = out.replace(/profile-level-id=([0-9a-fA-F]{4})1f/g, 'profile-level-id=$12a');
+
+  // 3. Remove travas de macroblocos de 720p30 do Firefox (max-fs=3600 / max-mbps=108000)
+  out = out.replace(/max-fs=\d+/g, 'max-fs=8160');
+  out = out.replace(/max-mbps=\d+/g, 'max-mbps=489600');
+
+  // 4. Força o estimador de banda WebRTC a iniciar em 8 Mbps (sem cair para 720p na largada)
+  const maxKbps = bitrateMbps * 1000;
+  out = out.replace(
+    /(a=fmtp:\d+ (?:level-asymmetry-allowed|profile-id|packetization-mode)[^\r\n]*)/g,
+    `$1;x-google-start-bitrate=8000;x-google-min-bitrate=5000;x-google-max-bitrate=${maxKbps}`
+  );
+
+  return out;
+}
+
+async function applyHighQualitySenderParams(pc, quality) {
+  if (!pc || !quality) return;
+  for (const sender of pc.getSenders()) {
+    if (sender.track && sender.track.kind === 'video') {
+      try {
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].maxBitrate = quality.maxBitrateBps;
+        params.encodings[0].maxFramerate = 60;
+        params.encodings[0].scaleResolutionDownBy = 1.0;
+        params.degradationPreference = 'maintain-resolution';
+        await sender.setParameters(params);
+      } catch {}
+    }
+  }
 }
 
 function arrayBufferToBase64(buffer) {
@@ -764,9 +801,16 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
             if (transceiver && transceiver.setCodecPreferences && RTCRtpSender.getCapabilities) {
               const caps = RTCRtpSender.getCapabilities('video');
               if (caps && caps.codecs) {
-                const preferred = caps.codecs.filter((c) =>
-                  c.mimeType.toLowerCase().includes(quality.codec.toLowerCase())
-                );
+                const preferred = caps.codecs
+                  .filter((c) => c.mimeType.toLowerCase().includes(quality.codec.toLowerCase()))
+                  // Prioriza perfis H.264 de nível alto (Level 4.2/5.0/5.1 para 1080p60) acima do Level 3.1 (1f = 720p30)
+                  .sort((a, b) => {
+                    const aFmtp = a.sdpFmtpLine || '';
+                    const bFmtp = b.sdpFmtpLine || '';
+                    const aIs31 = aFmtp.includes('1f') ? 1 : 0;
+                    const bIs31 = bFmtp.includes('1f') ? 1 : 0;
+                    return aIs31 - bIs31;
+                  });
                 const others = caps.codecs.filter(
                   (c) => !c.mimeType.toLowerCase().includes(quality.codec.toLowerCase())
                 );
@@ -776,28 +820,16 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
               }
             }
           } catch {}
-
-          setTimeout(async () => {
-            try {
-              const params = sender.getParameters();
-              if (!params.encodings || params.encodings.length === 0) {
-                params.encodings = [{}];
-              }
-              params.encodings[0].maxBitrate = quality.maxBitrateBps;
-              params.encodings[0].maxFramerate = 60;
-              params.degradationPreference = 'maintain-framerate';
-              await sender.setParameters(params);
-            } catch {}
-          }, 200);
         }
       }
 
       const offer = await pc.createOffer();
       const enhancedOffer = {
         type: offer.type,
-        sdp: enhanceSdpForStereoAudio(offer.sdp)
+        sdp: enhanceSdpForStereoAudio(offer.sdp, quality.bitrateMbps)
       };
       await pc.setLocalDescription(enhancedOffer);
+      await applyHighQualitySenderParams(pc, quality);
 
       await sendRequest('p2pSignal', {
         targetPeerId: fromPeerId,
@@ -862,7 +894,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
       const answer = await pc.createAnswer();
       const enhancedAnswer = {
         type: answer.type,
-        sdp: enhanceSdpForStereoAudio(answer.sdp)
+        sdp: enhanceSdpForStereoAudio(answer.sdp, payload.meta?.bitrateMbps || 12)
       };
       await pc.setLocalDescription(enhancedAnswer);
 
@@ -878,8 +910,16 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
     if (signalType === 'answer') {
       const senderObj = state.p2pSenders.get(fromPeerId);
       if (senderObj && senderObj.pc) {
-        await senderObj.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        const quality = state.localQuality || getSelectedQualityConfig();
+        const enhancedRemote = {
+          type: payload.sdp.type,
+          sdp: enhanceSdpForStereoAudio(payload.sdp.sdp, quality.bitrateMbps)
+        };
+        await senderObj.pc.setRemoteDescription(new RTCSessionDescription(enhancedRemote));
         await flushPendingCandidates(senderObj);
+        await applyHighQualitySenderParams(senderObj.pc, quality);
+        setTimeout(() => applyHighQualitySenderParams(senderObj.pc, quality), 800);
+        setTimeout(() => applyHighQualitySenderParams(senderObj.pc, quality), 2500);
       }
       return;
     }
@@ -1018,7 +1058,17 @@ async function startScreenShare() {
   const videoTrack = screenStream.getVideoTracks()[0];
   if (videoTrack) {
     try {
-      videoTrack.contentHint = quality.contentHint;
+      await videoTrack.applyConstraints({
+        width: { ideal: quality.width, max: quality.width },
+        height: { ideal: quality.height, max: quality.height },
+        frameRate: { ideal: 60, max: 60 }
+      });
+    } catch {}
+
+    // Nota: Não definir contentHint = 'motion' em captura de tela no Chromium,
+    // pois faz o navegador ativar downscale automático para 1280x720.
+    try {
+      videoTrack.contentHint = quality.contentHint === 'detail' ? 'detail' : '';
     } catch {}
 
     videoTrack.onended = () => {
