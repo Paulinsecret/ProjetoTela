@@ -10,8 +10,12 @@ const state = {
   wsReqId: 0,
   pendingRequests: new Map(),
 
+  // Contexto de Áudio Web para desbloquear reprodução em qualquer navegador/celular
+  audioCtx: null,
+
   // Captura local (quando EU estou compartilhando a tela)
   localScreenStream: null,
+  localExtraAudioStream: null,
   localQuality: null,
   isSharing: false,
 
@@ -19,7 +23,7 @@ const state = {
   p2pSenders: new Map(),
   p2pReceivers: new Map(),
 
-  // Gravadores de fallback via WebSocket Tunnel (quando operadora tem CGNAT estrito que bloqueia UDP)
+  // Gravadores de fallback via WebSocket Tunnel (quando operadora tem CGNAT estrito)
   wsRelayRecorders: new Map(),
 
   // Mapa de transmissões ativas na sala: streamId -> StreamEntry
@@ -76,6 +80,8 @@ const dom = {
   selectBitrate: document.getElementById('select-bitrate'),
   selectCodec: document.getElementById('select-codec'),
   selectContentHint: document.getElementById('select-content-hint'),
+  selectAudioSource: document.getElementById('select-audio-source'),
+  btnDetectAudioDevices: document.getElementById('btn-detect-audio-devices'),
 
   btnNetworkInfo: document.getElementById('btn-network-info'),
   networkModal: document.getElementById('network-modal'),
@@ -98,9 +104,95 @@ const dom = {
 };
 
 // ============================================================================
+// DESBLOQUEIO UNIVERSAL DE ÁUDIO (FIREFOX / CHROME / SAFARI / MOBILE)
+// ============================================================================
+function unlockGlobalAudioPlayback() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      if (!state.audioCtx) {
+        state.audioCtx = new AudioContextClass();
+      }
+      if (state.audioCtx.state === 'suspended') {
+        state.audioCtx.resume().catch(() => {});
+      }
+    }
+  } catch {}
+
+  // Tenta desmutar todos os vídeos remotos que estavam bloqueados por Autoplay
+  for (const entry of state.streams.values()) {
+    if (!entry.isLocal && entry.videoEl && !entry.userManuallyMuted) {
+      entry.videoEl.muted = false;
+      entry.videoEl.play().then(() => {
+        if (entry.unlockBannerEl) {
+          entry.unlockBannerEl.classList.add('hidden');
+        }
+        if (entry.muteBtnEl) {
+          entry.muteBtnEl.textContent = 'Som Ativo';
+        }
+      }).catch(() => {});
+    }
+  }
+}
+
+// Qualquer clique na página já libera o contexto de áudio do navegador
+document.addEventListener('click', unlockGlobalAudioPlayback, { passive: true });
+
+// ============================================================================
+// LISTAGEM E AUTORIZAÇÃO DE DISPOSITIVOS DE ÁUDIO (FIREFOX / QUALQUER PC)
+// ============================================================================
+async function requestAndPopulateAudioDevices(showPrompt = false) {
+  if (!navigator.mediaDevices) return;
+
+  if (showPrompt && navigator.mediaDevices.getUserMedia) {
+    try {
+      const tempStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+      for (const t of tempStream.getTracks()) {
+        t.stop();
+      }
+      showToast('Permissão de áudio concedida! Dispositivos carregados.');
+    } catch (err) {
+      showToast('Permissão de áudio negada ou nenhum dispositivo encontrado.');
+      return;
+    }
+  }
+
+  if (!navigator.mediaDevices.enumerateDevices || !dom.selectAudioSource) return;
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+
+    const currentVal = dom.selectAudioSource.value;
+    dom.selectAudioSource.innerHTML = `
+      <option value="auto">Automático (Áudio da Tela + Fallback Firefox/Dispositivo)</option>
+      <option value="device-default">Pedir Permissão de Áudio (Microfone / Mixagem Estéreo)</option>
+      <option value="none">Sem Áudio (Apenas Vídeo)</option>
+    `;
+
+    audioInputs.forEach((dev, idx) => {
+      const opt = document.createElement('option');
+      opt.value = `device:${dev.deviceId}`;
+      opt.textContent = `Dispositivo: ${dev.label || `Entrada de Áudio #${idx + 1}`}`;
+      dom.selectAudioSource.appendChild(opt);
+    });
+
+    if ([...dom.selectAudioSource.options].some((o) => o.value === currentVal)) {
+      dom.selectAudioSource.value = currentVal;
+    }
+  } catch {}
+}
+
+// ============================================================================
 // UTILITÁRIOS E NOTIFICAÇÕES
 // ============================================================================
-function showToast(message, durationMs = 3500) {
+function showToast(message, durationMs = 4000) {
   const el = document.createElement('div');
   el.className = 'toast-item';
   el.textContent = message;
@@ -132,6 +224,7 @@ function getSelectedQualityConfig() {
   const bitrateMbps = parseInt(dom.selectBitrate.value || '12', 10);
   const codec = dom.selectCodec.value || 'H264';
   const contentHint = dom.selectContentHint.value || 'motion';
+  const audioSource = dom.selectAudioSource ? dom.selectAudioSource.value : 'auto';
 
   return {
     label: resVal,
@@ -141,7 +234,8 @@ function getSelectedQualityConfig() {
     bitrateMbps,
     maxBitrateBps: bitrateMbps * 1000000,
     codec,
-    contentHint
+    contentHint,
+    audioSource
   };
 }
 
@@ -173,13 +267,20 @@ function base64ToUint8Array(base64) {
   return bytes;
 }
 
-function getSupportedRecorderMimeType() {
-  const candidates = [
+function getSupportedRecorderMimeType(hasAudio = true) {
+  const withAudio = [
     'video/webm;codecs=h264,opus',
     'video/webm;codecs=vp9,opus',
     'video/webm;codecs=vp8,opus',
     'video/webm'
   ];
+  const videoOnly = [
+    'video/webm;codecs=h264',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ];
+  const candidates = hasAudio ? withAudio : videoOnly;
   for (const mime of candidates) {
     if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mime)) {
       return mime;
@@ -236,6 +337,7 @@ async function tryAutoLogin() {
   }
 
   await fetchServerInfo();
+  requestAndPopulateAudioDevices(false);
 
   if (!state.token) return;
 
@@ -258,6 +360,7 @@ async function tryAutoLogin() {
 
 dom.loginForm.addEventListener('submit', async (e) => {
   e.preventDefault();
+  unlockGlobalAudioPlayback();
   dom.loginError.classList.add('hidden');
   dom.btnLogin.disabled = true;
 
@@ -457,8 +560,6 @@ async function requestFullIceStream(streamerPeerId, streamerDisplayName, meta = 
     payload: { meta }
   });
 
-  // Se após 4 segundos o CGNAT da operadora bloquear UDP direto e o vídeo ainda não tiver frames,
-  // ativa automaticamente o Relay via Túnel WebSocket HTTPS!
   if (entry.fallbackTimer) clearTimeout(entry.fallbackTimer);
   entry.fallbackTimer = setTimeout(() => {
     const current = state.streams.get(streamId);
@@ -485,7 +586,8 @@ function startWsRelayForViewer(viewerPeerId) {
     state.wsRelayRecorders.delete(viewerPeerId);
   }
 
-  const mimeType = getSupportedRecorderMimeType();
+  const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
+  const mimeType = getSupportedRecorderMimeType(hasAudio);
   if (!mimeType) return;
 
   const quality = state.localQuality || getSelectedQualityConfig();
@@ -522,14 +624,15 @@ function startWsRelayForViewer(viewerPeerId) {
           meta: {
             resolution: quality.label,
             bitrateMbps: quality.bitrateMbps,
-            codec: 'TUNNEL-RELAY'
+            codec: 'TUNNEL-RELAY',
+            hasAudio
           }
         }
       });
     } catch {}
   };
 
-  recorder.start(100); // Fragmentos de 100ms para baixa latência
+  recorder.start(100);
   state.wsRelayRecorders.set(viewerPeerId, recorder);
 }
 
@@ -555,7 +658,7 @@ function handleIncomingWsRelayChunk(fromPeerId, fromDisplayName, payload) {
     if (entry.videoEl) {
       entry.videoEl.srcObject = null;
       entry.videoEl.src = URL.createObjectURL(ms);
-      entry.videoEl.muted = false; // Áudio e vídeo vêm juntos no container WebM
+      entry.videoEl.muted = Boolean(entry.userManuallyMuted);
     }
 
     ms.addEventListener('sourceopen', () => {
@@ -569,9 +672,8 @@ function handleIncomingWsRelayChunk(fromPeerId, fromDisplayName, payload) {
             sb.appendBuffer(entry.wsChunkQueue.shift());
           }
           if (entry.videoEl && entry.videoEl.paused) {
-            entry.videoEl.play().catch(() => {});
+            tryPlayRemoteVideoWithAudio(entry);
           }
-          // Mantém o vídeo sempre colado no tempo real (baixa latência)
           if (entry.videoEl && entry.videoEl.buffered.length > 0) {
             const end = entry.videoEl.buffered.end(entry.videoEl.buffered.length - 1);
             if (end - entry.videoEl.currentTime > 0.75) {
@@ -651,6 +753,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
       };
 
       const quality = state.localQuality || getSelectedQualityConfig();
+      const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
 
       for (const track of state.localScreenStream.getTracks()) {
         const sender = pc.addTrack(track, state.localScreenStream);
@@ -704,7 +807,8 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
           meta: {
             resolution: quality.label,
             bitrateMbps: quality.bitrateMbps,
-            codec: quality.codec
+            codec: quality.codec,
+            hasAudio
           }
         }
       });
@@ -809,9 +913,11 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 }
 
 // ============================================================================
-// CAPTURA E TRANSMISSÃO DE TELA / JOGO EM 1080P 60FPS + ÁUDIO ESTÉREO
+// CAPTURA UNIVERSAL DE TELA + ÁUDIO (CHROME / EDGE / FIREFOX / MOBILE)
 // ============================================================================
 async function startScreenShare() {
+  unlockGlobalAudioPlayback();
+
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
     showToast(
       'O navegador exige conexão segura (HTTPS ou localhost) para compartilhar a tela.',
@@ -823,6 +929,7 @@ async function startScreenShare() {
 
   const quality = getSelectedQualityConfig();
   state.localQuality = quality;
+  const wantAudio = quality.audioSource !== 'none';
 
   let screenStream;
   try {
@@ -833,20 +940,75 @@ async function startScreenShare() {
         frameRate: { ideal: 60, max: 60 },
         cursor: 'always'
       },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        channelCount: 2,
-        sampleRate: 48000,
-        sampleSize: 16
-      },
+      audio: wantAudio
+        ? {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        : false,
       systemAudio: 'include',
+      windowAudio: 'system',
       surfaceSwitching: 'include',
       selfBrowserSurface: 'exclude'
     });
   } catch {
     return;
+  }
+
+  // SE O NAVEGADOR (EX: FIREFOX OU CAPTURA DE JANELA SEM SOM) NÃO TROUXE TRILHA DE ÁUDIO,
+  // OU SE O USUÁRIO ESCOLHEU UM DISPOSITIVO ESPECÍFICO, PEDIMOS PERMISSÃO DE ÁUDIO VIA getUserMedia!
+  const needsExtraAudio =
+    wantAudio &&
+    (screenStream.getAudioTracks().length === 0 ||
+      quality.audioSource === 'device-default' ||
+      quality.audioSource.startsWith('device:'));
+
+  if (needsExtraAudio && navigator.mediaDevices.getUserMedia) {
+    try {
+      const audioConstraints = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      };
+
+      if (quality.audioSource.startsWith('device:')) {
+        const deviceId = quality.audioSource.slice('device:'.length);
+        audioConstraints.deviceId = { exact: deviceId };
+      }
+
+      const extraAudioStream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints
+      });
+
+      state.localExtraAudioStream = extraAudioStream;
+
+      // Se o usuário escolheu um dispositivo específico, substitui eventual áudio anterior
+      if (quality.audioSource !== 'auto') {
+        for (const oldAudio of screenStream.getAudioTracks()) {
+          screenStream.removeTrack(oldAudio);
+          oldAudio.stop();
+        }
+      }
+
+      for (const aTrack of extraAudioStream.getAudioTracks()) {
+        screenStream.addTrack(aTrack);
+      }
+
+      requestAndPopulateAudioDevices(false);
+    } catch (err) {
+      console.warn('[Audio Fallback] Usuário não autorizou dispositivo de áudio extra:', err);
+    }
+  }
+
+  const capturedAudioCount = screenStream.getAudioTracks().length;
+  if (wantAudio && capturedAudioCount === 0) {
+    showToast(
+      'Aviso: Nenhum áudio foi selecionado! Para enviar som do jogo no Chrome/Edge, marque "Compartilhar áudio do sistema" (aba Tela Cheia), ou autorize o dispositivo de áudio no Firefox.',
+      7000
+    );
+  } else if (capturedAudioCount > 0) {
+    showToast('Transmissão iniciada com Vídeo 1080p60 + Áudio Ativo!');
   }
 
   state.localScreenStream = screenStream;
@@ -864,6 +1026,13 @@ async function startScreenShare() {
     };
   }
 
+  const meta = {
+    resolution: quality.label,
+    bitrateMbps: quality.bitrateMbps,
+    codec: quality.codec,
+    hasAudio: capturedAudioCount > 0
+  };
+
   upsertStreamTile({
     streamId,
     peerId: state.peerId,
@@ -871,24 +1040,15 @@ async function startScreenShare() {
     isLocal: true,
     videoTrack,
     audioTrack: null,
-    meta: {
-      resolution: quality.label,
-      bitrateMbps: quality.bitrateMbps,
-      codec: quality.codec
-    }
+    meta
   });
 
   await sendRequest('announceStream', {
     streamId,
-    meta: {
-      resolution: quality.label,
-      bitrateMbps: quality.bitrateMbps,
-      codec: quality.codec
-    }
+    meta
   });
 
   updateShareButtonUI(true);
-  showToast('Transmissão iniciada em alta definição!');
 }
 
 async function stopScreenShare() {
@@ -908,6 +1068,15 @@ async function stopScreenShare() {
     } catch {}
   }
   state.p2pSenders.clear();
+
+  if (state.localExtraAudioStream) {
+    for (const t of state.localExtraAudioStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {}
+    }
+    state.localExtraAudioStream = null;
+  }
 
   if (state.localScreenStream) {
     for (const track of state.localScreenStream.getTracks()) {
@@ -950,6 +1119,56 @@ function handleRemoteProducerClosed({ streamId, peerId }) {
 }
 
 // ============================================================================
+// REPRODUÇÃO DE VÍDEO + ÁUDIO COM TRATAMENTO UNIVERSAL DE AUTOPLAY
+// ============================================================================
+function tryPlayRemoteVideoWithAudio(entry) {
+  if (!entry || !entry.videoEl) return;
+
+  if (entry.isLocal) {
+    entry.videoEl.muted = true;
+    entry.videoEl.play().catch(() => {});
+    return;
+  }
+
+  // Se o espectador não mutou manualmente, tentamos tocar COM SOM direto no elemento <video>
+  if (!entry.userManuallyMuted) {
+    entry.videoEl.muted = false;
+  }
+
+  entry.videoEl
+    .play()
+    .then(() => {
+      if (entry.unlockBannerEl) {
+        entry.unlockBannerEl.classList.add('hidden');
+      }
+    })
+    .catch(() => {
+      // O navegador (Firefox / Safari / Mobile) bloqueou Autoplay com som sem clique prévio:
+      // Iniciamos o vídeo mutado para não congelar a imagem e exibimos o botão "Ativar Som"!
+      entry.videoEl.muted = true;
+      entry.videoEl.play().catch(() => {});
+      if (entry.unlockBannerEl && (entry.audioTrack || entry.meta?.hasAudio)) {
+        entry.unlockBannerEl.classList.remove('hidden');
+      }
+      if (entry.muteBtnEl) {
+        entry.muteBtnEl.textContent = 'Ativar Som';
+      }
+    });
+}
+
+function updateAudioBadgeUI(entry) {
+  if (!entry || !entry.audioBadgeEl) return;
+  const hasAudio = Boolean(entry.audioTrack) || Boolean(entry.meta?.hasAudio);
+  if (hasAudio) {
+    entry.audioBadgeEl.className = 'telemetry-pill audio-ok';
+    entry.audioBadgeEl.textContent = 'SOM ATIVO';
+  } else {
+    entry.audioBadgeEl.className = 'telemetry-pill audio-none';
+    entry.audioBadgeEl.textContent = 'SEM ÁUDIO';
+  }
+}
+
+// ============================================================================
 // GERENCIAMENTO DO PALCO E MOSAICO DE VÍDEOS + VOLUME INDIVIDUAL
 // ============================================================================
 function upsertStreamTile({
@@ -971,21 +1190,23 @@ function upsertStreamTile({
       displayName,
       isLocal,
       mediaStream: new MediaStream(),
-      audioStream: new MediaStream(),
       videoTrack: null,
       audioTrack: null,
       p2pPc: null,
       usingWsRelay: false,
       wsRelayBytes: 0,
+      userManuallyMuted: false,
       meta: meta || {},
       prevBytes: 0,
       prevTimestamp: 0,
       cardEl: null,
       videoEl: null,
-      audioEl: null,
+      unlockBannerEl: null,
+      muteBtnEl: null,
       resBadgeEl: null,
       bitrateBadgeEl: null,
-      codecBadgeEl: null
+      codecBadgeEl: null,
+      audioBadgeEl: null
     };
     state.streams.set(streamId, entry);
   }
@@ -1014,42 +1235,47 @@ function upsertStreamTile({
     }
     entry.videoTrack = videoTrack;
 
-    const attachAndPlayVideo = () => {
+    const attachAndPlay = () => {
       if (entry.videoEl && !entry.usingWsRelay) {
         if (entry.videoEl.srcObject !== entry.mediaStream) {
           entry.videoEl.srcObject = entry.mediaStream;
         }
-        entry.videoEl.play().catch(() => {});
+        tryPlayRemoteVideoWithAudio(entry);
       }
     };
 
-    attachAndPlayVideo();
-    videoTrack.onunmute = attachAndPlayVideo;
+    attachAndPlay();
+    videoTrack.onunmute = attachAndPlay;
   }
 
+  // Adicionamos a trilha de áudio DIRETAMENTE ao mesmo MediaStream do <video>
+  // para máxima compatibilidade com Firefox, Chrome, Safari e Mobile!
   if (audioTrack && !isLocal && !entry.usingWsRelay) {
-    for (const old of entry.audioStream.getAudioTracks()) {
+    for (const old of entry.mediaStream.getAudioTracks()) {
       if (old.id !== audioTrack.id) {
-        entry.audioStream.removeTrack(old);
+        entry.mediaStream.removeTrack(old);
       }
     }
-    if (!entry.audioStream.getAudioTracks().some((t) => t.id === audioTrack.id)) {
-      entry.audioStream.addTrack(audioTrack);
+    if (!entry.mediaStream.getAudioTracks().some((t) => t.id === audioTrack.id)) {
+      entry.mediaStream.addTrack(audioTrack);
     }
     entry.audioTrack = audioTrack;
+    entry.meta.hasAudio = true;
 
     const attachAndPlayAudio = () => {
-      if (entry.audioEl && !entry.usingWsRelay) {
-        if (entry.audioEl.srcObject !== entry.audioStream) {
-          entry.audioEl.srcObject = entry.audioStream;
+      if (entry.videoEl && !entry.usingWsRelay) {
+        if (entry.videoEl.srcObject !== entry.mediaStream) {
+          entry.videoEl.srcObject = entry.mediaStream;
         }
-        entry.audioEl.play().catch(() => {});
+        tryPlayRemoteVideoWithAudio(entry);
       }
     };
 
     attachAndPlayAudio();
     audioTrack.onunmute = attachAndPlayAudio;
   }
+
+  updateAudioBadgeUI(entry);
 
   if (!state.featuredStreamId || !state.streams.has(state.featuredStreamId)) {
     state.featuredStreamId = streamId;
@@ -1068,12 +1294,28 @@ function createStreamCardDOM(entry) {
   video.className = 'stream-video';
   video.autoplay = true;
   video.playsInline = true;
-  video.muted = true;
+  video.muted = Boolean(entry.isLocal);
+  video.volume = 1.0;
   entry.videoEl = video;
 
-  const audio = document.createElement('audio');
-  audio.autoplay = true;
-  entry.audioEl = audio;
+  // Banner clicável caso o navegador bloqueie Autoplay de som antes do clique do usuário
+  const unlockBanner = document.createElement('button');
+  unlockBanner.type = 'button';
+  unlockBanner.className = 'audio-unlock-banner hidden';
+  unlockBanner.textContent = '🔊 Clique aqui para Ativar o Som da Transmissão';
+  unlockBanner.addEventListener('click', (e) => {
+    e.stopPropagation();
+    entry.userManuallyMuted = false;
+    video.muted = false;
+    if (video.volume === 0) video.volume = 1.0;
+    unlockGlobalAudioPlayback();
+    video.play().catch(() => {});
+    unlockBanner.classList.add('hidden');
+    if (entry.muteBtnEl) {
+      entry.muteBtnEl.textContent = 'Som Ativo';
+    }
+  });
+  entry.unlockBannerEl = unlockBanner;
 
   const topOverlay = document.createElement('div');
   topOverlay.className = 'stream-overlay-top';
@@ -1088,6 +1330,11 @@ function createStreamCardDOM(entry) {
 
   const telemetry = document.createElement('div');
   telemetry.className = 'stream-telemetry';
+
+  const audioBadge = document.createElement('span');
+  audioBadge.className = 'telemetry-pill audio-ok';
+  audioBadge.textContent = 'SOM ATIVO';
+  entry.audioBadgeEl = audioBadge;
 
   const resBadge = document.createElement('span');
   resBadge.className = 'telemetry-pill';
@@ -1104,7 +1351,7 @@ function createStreamCardDOM(entry) {
   codecBadge.textContent = entry.meta?.codec || 'H264';
   entry.codecBadgeEl = codecBadge;
 
-  telemetry.append(resBadge, bitrateBadge, codecBadge);
+  telemetry.append(audioBadge, resBadge, bitrateBadge, codecBadge);
   topOverlay.append(authorBadge, telemetry);
 
   const bottomOverlay = document.createElement('div');
@@ -1117,13 +1364,14 @@ function createStreamCardDOM(entry) {
     const selfLabel = document.createElement('span');
     selfLabel.className = 'mono-label';
     selfLabel.style.color = '#a1a1aa';
-    selfLabel.textContent = 'Sua transmissão (Áudio local silenciado)';
+    selfLabel.textContent = 'Sua transmissão (Áudio local silenciado para evitar eco)';
     audioControls.appendChild(selfLabel);
   } else {
     const muteBtn = document.createElement('button');
     muteBtn.type = 'button';
     muteBtn.className = 'btn-stream-ctrl';
     muteBtn.textContent = 'Som Ativo';
+    entry.muteBtnEl = muteBtn;
 
     const volSlider = document.createElement('input');
     volSlider.type = 'range';
@@ -1134,28 +1382,31 @@ function createStreamCardDOM(entry) {
 
     muteBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (entry.usingWsRelay) {
-        video.muted = !video.muted;
-        muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
-      } else {
-        audio.muted = !audio.muted;
-        muteBtn.textContent = audio.muted ? 'Mutado' : 'Som Ativo';
-        if (!audio.muted) audio.play().catch(() => {});
+      unlockGlobalAudioPlayback();
+      video.muted = !video.muted;
+      entry.userManuallyMuted = video.muted;
+      muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
+      if (!video.muted) {
+        if (video.volume === 0) {
+          video.volume = 1.0;
+          volSlider.value = '100';
+        }
+        unlockBanner.classList.add('hidden');
+        video.play().catch(() => {});
       }
     });
 
     volSlider.addEventListener('input', (e) => {
       e.stopPropagation();
+      unlockGlobalAudioPlayback();
       const val = parseInt(e.target.value, 10) / 100;
-      if (entry.usingWsRelay) {
-        video.volume = val;
-        video.muted = val === 0;
-        muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
-      } else {
-        audio.volume = val;
-        audio.muted = val === 0;
-        muteBtn.textContent = audio.muted ? 'Mutado' : 'Som Ativo';
-        if (!audio.muted) audio.play().catch(() => {});
+      video.volume = val;
+      video.muted = val === 0;
+      entry.userManuallyMuted = video.muted;
+      muteBtn.textContent = video.muted ? 'Mutado' : 'Som Ativo';
+      if (!video.muted) {
+        unlockBanner.classList.add('hidden');
+        video.play().catch(() => {});
       }
     });
 
@@ -1208,13 +1459,14 @@ function createStreamCardDOM(entry) {
   bottomOverlay.append(audioControls, actionsRight);
 
   card.addEventListener('click', () => {
+    unlockGlobalAudioPlayback();
     if (state.layoutMode === 'stage' && state.featuredStreamId !== entry.streamId) {
       state.featuredStreamId = entry.streamId;
       syncWorkspaceLayout();
     }
   });
 
-  card.append(video, audio, topOverlay, bottomOverlay);
+  card.append(video, unlockBanner, topOverlay, bottomOverlay);
   return card;
 }
 
@@ -1446,6 +1698,13 @@ dom.btnToggleQuality.addEventListener('click', (e) => {
   dom.membersPopover.classList.add('hidden');
   dom.qualityPopover.classList.toggle('hidden');
 });
+
+if (dom.btnDetectAudioDevices) {
+  dom.btnDetectAudioDevices.addEventListener('click', (e) => {
+    e.stopPropagation();
+    requestAndPopulateAudioDevices(true);
+  });
+}
 
 [dom.selectResolution, dom.selectBitrate, dom.selectCodec, dom.selectContentHint].forEach((sel) => {
   sel.addEventListener('change', updateQualitySummaryPill);

@@ -199,6 +199,18 @@
                   <option value="detail">Nitidez de Texto (Código / Desktop)</option>
                 </select>
               </div>
+
+              <div class="setting-row">
+                <label for="select-audio-source" class="setting-label">Fonte de Áudio (Firefox / Todos os Dispositivos)</label>
+                <select id="select-audio-source" class="setting-select">
+                  <option value="auto" selected>Automático (Áudio da Tela + Permissão Firefox/Dispositivo)</option>
+                  <option value="device-default">Forçar Dispositivo de Áudio / Mixagem Estéreo / Mic</option>
+                  <option value="none">Sem Áudio (Apenas Vídeo)</option>
+                </select>
+                <button type="button" id="btn-detect-audio-devices" class="btn btn-secondary btn-sm" style="margin-top: 6px; width: 100%;">
+                  Autorizar e Listar Dispositivos de Áudio
+                </button>
+              </div>
             </div>
           </div>
         </div>
