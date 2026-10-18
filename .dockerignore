@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+certs
+public/dist
+caddy_data
+caddy_config

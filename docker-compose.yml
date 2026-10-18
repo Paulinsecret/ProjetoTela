@@ -1,0 +1,40 @@
+services:
+  stage-sfu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stage-sfu
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      # Acesso HTTP direto (Localhost / Túnel reverso)
+      - "${PORT:-3000}:3000"
+      # Acesso HTTPS direto embutido (LAN / Tailscale / Radmin VPN)
+      - "${HTTPS_PORT:-3443}:3443"
+      # Portas de Mídia WebRTC (Vídeo 1080p60 + Áudio Opus Estéreo)
+      - "${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}:${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}/udp"
+      - "${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}:${RTC_MIN_PORT:-40000}-${RTC_MAX_PORT:-40050}/tcp"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: stage-caddy-https
+    restart: unless-stopped
+    depends_on:
+      - stage-sfu
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN:-localhost}
+    ports:
+      - "8080:80"
+      - "8443:443"
+      - "8443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
