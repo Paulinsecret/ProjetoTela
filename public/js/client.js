@@ -1589,6 +1589,87 @@ function createStreamCardDOM(entry) {
   actionsRight.append(btnDiag, btnFeature, btnPip, btnFullscreen);
   bottomOverlay.append(audioControls, actionsRight);
 
+  // ========================================================================
+  // COMPORTAMENTO ESTILO YOUTUBE: CONTROLES OCULTOS APÓS INATIVIDADE
+  // ========================================================================
+  let hideControlsTimer = null;
+  let isDraggingSlider = false;
+
+  function showControls() {
+    card.classList.remove('user-inactive');
+    card.classList.add('user-active');
+  }
+
+  function hideControls() {
+    if (isDraggingSlider) return;
+    if (diagPanel && !diagPanel.classList.contains('hidden')) return;
+    card.classList.remove('user-active');
+    card.classList.add('user-inactive');
+  }
+
+  function scheduleControlsHide() {
+    showControls();
+    if (hideControlsTimer) clearTimeout(hideControlsTimer);
+    hideControlsTimer = setTimeout(hideControls, 2500);
+  }
+
+  card.addEventListener('mousemove', scheduleControlsHide);
+  card.addEventListener('pointermove', scheduleControlsHide);
+  card.addEventListener('mousedown', scheduleControlsHide);
+  card.addEventListener('touchstart', scheduleControlsHide, { passive: true });
+
+  card.addEventListener('mouseleave', () => {
+    // Em tela cheia, o ponteiro não sai do monitor; fora dela, recolhe imediatamente
+    if (document.fullscreenElement === card) return;
+    if (hideControlsTimer) clearTimeout(hideControlsTimer);
+    if (diagPanel && !diagPanel.classList.contains('hidden')) return;
+    card.classList.remove('user-active');
+    card.classList.remove('user-inactive');
+  });
+
+  volSlider.addEventListener('mousedown', () => {
+    isDraggingSlider = true;
+    showControls();
+  });
+  volSlider.addEventListener('mouseup', () => {
+    isDraggingSlider = false;
+    scheduleControlsHide();
+  });
+  volSlider.addEventListener('touchstart', () => {
+    isDraggingSlider = true;
+    showControls();
+  }, { passive: true });
+  volSlider.addEventListener('touchend', () => {
+    isDraggingSlider = false;
+    scheduleControlsHide();
+  });
+
+  // Duplo clique no vídeo para alternar Tela Cheia (estilo YouTube)
+  video.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (card.requestFullscreen) {
+      card.requestFullscreen().catch(() => {});
+    }
+  });
+
+  const handleFullscreenChange = () => {
+    if (document.fullscreenElement === card) {
+      btnFullscreen.textContent = 'Sair da Tela Cheia';
+      scheduleControlsHide();
+    } else {
+      btnFullscreen.textContent = 'Tela Cheia';
+      card.classList.remove('user-inactive');
+    }
+  };
+  document.addEventListener('fullscreenchange', handleFullscreenChange);
+
+  entry._cleanup = () => {
+    if (hideControlsTimer) clearTimeout(hideControlsTimer);
+    document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  };
+
   card.addEventListener('click', () => {
     unlockGlobalAudioPlayback();
     if (state.layoutMode === 'stage' && state.featuredStreamId !== entry.streamId) {
@@ -1604,6 +1685,12 @@ function createStreamCardDOM(entry) {
 function removeStreamTile(streamId) {
   const entry = state.streams.get(streamId);
   if (!entry) return;
+
+  if (entry._cleanup) {
+    try {
+      entry._cleanup();
+    } catch {}
+  }
 
   try {
     if (entry.audioEl) {

@@ -749,8 +749,10 @@ body {
   justify-content: space-between;
   gap: 8px;
   pointer-events: none;
-  opacity: 1;
-  transition: opacity 0.2s ease;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  z-index: 8;
 }
 
 .stream-author-badge {
@@ -808,11 +810,59 @@ body {
   justify-content: space-between;
   gap: 10px;
   opacity: 0;
-  transition: opacity 0.18s ease;
+  transform: translateY(6px);
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  z-index: 8;
+  pointer-events: none;
 }
 
-.stream-card:hover .stream-overlay-bottom {
+.stream-overlay-bottom > * {
+  pointer-events: auto;
+}
+
+/* Visibilidade quando o usuário passa o mouse ou movimenta o cursor (estilo YouTube) */
+.stream-card.user-active .stream-overlay-top,
+.stream-card.user-active .stream-overlay-bottom,
+.stream-card:not(.user-inactive):hover .stream-overlay-top,
+.stream-card:not(.user-inactive):hover .stream-overlay-bottom {
   opacity: 1;
+  transform: translateY(0);
+}
+
+/* Modo inativo: esconde controles e o cursor do mouse após inatividade */
+.stream-card.user-inactive {
+  cursor: none !important;
+}
+
+.stream-card.user-inactive * {
+  cursor: none !important;
+}
+
+.stream-card.user-inactive .stream-overlay-top,
+.stream-card.user-inactive .stream-overlay-bottom {
+  opacity: 0 !important;
+  transform: translateY(0) !important;
+  pointer-events: none !important;
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+/* Tela Cheia nativa do card */
+.stream-card:fullscreen {
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
+  border: none !important;
+  border-radius: 0 !important;
+  background-color: #000000 !important;
+}
+
+.stream-card:fullscreen .stream-video {
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
+  object-fit: contain !important;
 }
 
 .audio-controls {
