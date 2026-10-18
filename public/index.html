@@ -332,6 +332,80 @@
     </div>
   </div>
 
+  <!-- MODAL ASSISTENTE DE COMPARTILHAMENTO COM ÁUDIO (ESPECIAL FIREFOX & DISPOSITIVOS) -->
+  <div id="firefox-share-modal" class="modal-backdrop hidden">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-header">
+        <h3>Compartilhar Tela + Áudio (Assistente Firefox)</h3>
+        <button type="button" id="btn-close-firefox-modal" class="btn-icon">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-text">
+          O seletor nativo de tela do <strong>Mozilla Firefox</strong> não possui a caixinha <em>"Compartilhar áudio do sistema"</em> igual ao Microsoft Edge/Chrome. Use este painel abaixo para incluir o áudio junto com o vídeo da sua tela:
+        </p>
+
+        <!-- Chave para incluir áudio (estilo Edge) -->
+        <div class="audio-setup-box">
+          <label class="audio-toggle-row">
+            <input type="checkbox" id="chk-firefox-include-audio" checked />
+            <span><strong>Compartilhar o áudio junto com o vídeo</strong> (Estéreo 256 kbps)</span>
+          </label>
+
+          <div id="firefox-audio-config-area" class="firefox-audio-config-area">
+            <div class="setting-row">
+              <label for="select-firefox-audio-device" class="setting-label">
+                Dispositivo de Áudio para enviar na transmissão:
+              </label>
+              <div class="copy-row">
+                <select id="select-firefox-audio-device" class="setting-select" style="flex: 1;">
+                  <option value="default">Padrão do Sistema (Pedir permissão ao Firefox)</option>
+                </select>
+                <button type="button" id="btn-firefox-test-audio" class="btn btn-secondary btn-sm">
+                  1. Autorizar e Testar Áudio
+                </button>
+              </div>
+            </div>
+
+            <!-- Medidor de Volume ao Vivo (VU Meter) -->
+            <div class="vu-meter-row">
+              <span id="firefox-audio-status" class="mono-label vu-status">Aguardando autorização de áudio...</span>
+              <div class="vu-meter-track">
+                <div id="firefox-vu-bar" class="vu-meter-fill" style="width: 0%;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Ações Principais -->
+        <div class="firefox-modal-actions">
+          <button type="button" id="btn-firefox-start-share" class="btn btn-primary btn-full btn-lg">
+            2. Escolher Tela / Janela e Iniciar Transmissão (1080p60)
+          </button>
+
+          <div class="firefox-alt-row">
+            <button type="button" id="btn-firefox-share-file" class="btn btn-secondary btn-sm" style="flex: 1;">
+              🎬 Ou Transmitir Arquivo de Vídeo do PC (Com Áudio 100% Direto)
+            </button>
+            <input type="file" id="input-local-video-file" accept="video/*,audio/*" class="hidden" />
+          </div>
+        </div>
+
+        <!-- Explicação prática de como enviar o som interno do PC/Jogo pelo Firefox -->
+        <div class="network-tips">
+          <div class="tip-item">
+            <strong>💡 Como enviar o som interno do Jogo / Windows pelo Firefox:</strong>
+            <span>1. Quando o Firefox abrir o pedido de permissão de áudio no topo da página, escolha <strong>"Mixagem Estéreo (Stereo Mix)"</strong> ou <strong>"CABLE Output"</strong> na lista (em vez do Microfone).</span>
+            <span>2. Se "Mixagem Estéreo" não aparecer no seu Windows: aperte <code>Win + R</code>, digite <code>mmsys.cpl</code>, vá na aba <strong>Gravação</strong>, clique com botão direito &rarr; <em>Mostrar Dispositivos Desabilitados</em> e ative a <strong>Mixagem Estéreo</strong>.</span>
+          </div>
+          <div class="tip-item">
+            <strong>⚡ Alternativa Instantânea (1 Clique):</strong>
+            <span>Se preferir não ativar a Mixagem Estéreo no Windows, basta abrir este link no <strong>Microsoft Edge</strong> ou <strong>Google Chrome</strong> quando você for o transmissor da tela.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Notificação Toast Discreta -->
   <div id="toast-container" class="toast-container"></div>
 

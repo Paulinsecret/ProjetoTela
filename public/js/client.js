@@ -16,6 +16,8 @@ const state = {
   // Captura local (quando EU estou compartilhando a tela)
   localScreenStream: null,
   localExtraAudioStream: null,
+  localFileVideoEl: null,
+  vuInterval: null,
   localQuality: null,
   isSharing: false,
 
@@ -44,6 +46,9 @@ const state = {
     { urls: 'stun:stun2.l.google.com:19302' }
   ]
 };
+
+const isFirefoxBrowser =
+  typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent || '');
 
 // ============================================================================
 // ELEMENTOS DO DOM
@@ -89,6 +94,18 @@ const dom = {
   currentUrlCode: document.getElementById('current-url-code'),
   btnCopyUrl: document.getElementById('btn-copy-url'),
   networkIpsList: document.getElementById('network-ips-list'),
+
+  firefoxShareModal: document.getElementById('firefox-share-modal'),
+  btnCloseFirefoxModal: document.getElementById('btn-close-firefox-modal'),
+  chkFirefoxIncludeAudio: document.getElementById('chk-firefox-include-audio'),
+  firefoxAudioConfigArea: document.getElementById('firefox-audio-config-area'),
+  selectFirefoxAudioDevice: document.getElementById('select-firefox-audio-device'),
+  btnFirefoxTestAudio: document.getElementById('btn-firefox-test-audio'),
+  firefoxAudioStatus: document.getElementById('firefox-audio-status'),
+  firefoxVuBar: document.getElementById('firefox-vu-bar'),
+  btnFirefoxStartShare: document.getElementById('btn-firefox-start-share'),
+  btnFirefoxShareFile: document.getElementById('btn-firefox-share-file'),
+  inputLocalVideoFile: document.getElementById('input-local-video-file'),
 
   btnShareScreen: document.getElementById('btn-share-screen'),
   btnShareLabel: document.getElementById('btn-share-label'),
@@ -953,9 +970,272 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 }
 
 // ============================================================================
+// ASSISTENTE DE ÁUDIO + TELA PARA FIREFOX E DISPOSITIVOS DE ÁUDIO
+// ============================================================================
+function stopVuMeter() {
+  if (state.vuInterval) {
+    clearInterval(state.vuInterval);
+    state.vuInterval = null;
+  }
+  if (dom.firefoxVuBar) {
+    dom.firefoxVuBar.style.width = '0%';
+  }
+}
+
+function startVuMeterForStream(stream) {
+  stopVuMeter();
+  if (!stream || stream.getAudioTracks().length === 0) return;
+
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    if (!state.audioCtx) {
+      state.audioCtx = new AudioContextClass();
+    }
+    if (state.audioCtx.state === 'suspended') {
+      state.audioCtx.resume().catch(() => {});
+    }
+
+    const source = state.audioCtx.createMediaStreamSource(stream);
+    const analyser = state.audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    state.vuInterval = setInterval(() => {
+      if (!stream.active || stream.getAudioTracks().length === 0) {
+        stopVuMeter();
+        return;
+      }
+      analyser.getByteFrequencyData(dataArray);
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        sum += dataArray[i];
+      }
+      const avg = sum / dataArray.length;
+      const pct = Math.min(100, Math.round((avg / 90) * 100));
+      if (dom.firefoxVuBar) {
+        dom.firefoxVuBar.style.width = `${pct}%`;
+      }
+    }, 80);
+  } catch {}
+}
+
+async function populateFirefoxModalAudioDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices || !dom.selectFirefoxAudioDevice) {
+    return;
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+    const prevValue = dom.selectFirefoxAudioDevice.value;
+
+    dom.selectFirefoxAudioDevice.innerHTML = `
+      <option value="default">Padrão Selecionado no Popup do Firefox (Mixagem Estéreo / Mic)</option>
+    `;
+
+    let preferredLoopbackId = null;
+    audioInputs.forEach((dev, idx) => {
+      const opt = document.createElement('option');
+      opt.value = dev.deviceId;
+      const label = dev.label || `Dispositivo de Áudio #${idx + 1}`;
+      opt.textContent = label;
+      if (/mixagem|stereo mix|what u hear|loopback|cable|virtual|wave/i.test(label)) {
+        opt.textContent = `★ ${label} (Áudio do Sistema/PC)`;
+        if (!preferredLoopbackId) preferredLoopbackId = dev.deviceId;
+      }
+      dom.selectFirefoxAudioDevice.appendChild(opt);
+    });
+
+    if (
+      prevValue &&
+      prevValue !== 'default' &&
+      [...dom.selectFirefoxAudioDevice.options].some((o) => o.value === prevValue)
+    ) {
+      dom.selectFirefoxAudioDevice.value = prevValue;
+    } else if (preferredLoopbackId) {
+      dom.selectFirefoxAudioDevice.value = preferredLoopbackId;
+    }
+  } catch {}
+}
+
+async function authorizeAndPreviewFirefoxAudio() {
+  unlockGlobalAudioPlayback();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast('Seu navegador bloqueou o acesso a dispositivos de áudio.');
+    return null;
+  }
+
+  try {
+    if (state.localExtraAudioStream) {
+      for (const t of state.localExtraAudioStream.getTracks()) {
+        try {
+          t.stop();
+        } catch {}
+      }
+      state.localExtraAudioStream = null;
+    }
+
+    const selectedDeviceId = dom.selectFirefoxAudioDevice ? dom.selectFirefoxAudioDevice.value : 'default';
+    const audioConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    };
+    if (selectedDeviceId && selectedDeviceId !== 'default') {
+      audioConstraints.deviceId = { exact: selectedDeviceId };
+    }
+
+    const audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: audioConstraints
+    });
+
+    state.localExtraAudioStream = audioStream;
+    await populateFirefoxModalAudioDevices();
+    await requestAndPopulateAudioDevices(false);
+
+    const track = audioStream.getAudioTracks()[0];
+    const trackLabel = track && track.label ? track.label : 'Dispositivo Autorizado';
+
+    if (dom.firefoxAudioStatus) {
+      dom.firefoxAudioStatus.textContent = `✓ Áudio Conectado: ${trackLabel}`;
+      dom.firefoxAudioStatus.classList.add('status-ready');
+    }
+
+    startVuMeterForStream(audioStream);
+
+    // Se o usuário já estiver transmitindo a tela no momento, injeta o áudio ao vivo imediatamente!
+    if (state.isSharing && state.localScreenStream) {
+      await injectAudioStreamIntoLiveShare(audioStream);
+      if (dom.firefoxShareModal) {
+        dom.firefoxShareModal.classList.add('hidden');
+      }
+      stopVuMeter();
+    }
+
+    return audioStream;
+  } catch (err) {
+    if (dom.firefoxAudioStatus) {
+      dom.firefoxAudioStatus.textContent =
+        'Permissão de áudio não concedida. Clique em "1. Autorizar e Testar Áudio" e permita no topo do Firefox.';
+      dom.firefoxAudioStatus.classList.remove('status-ready');
+    }
+    showToast('Permissão de áudio negada ou cancelada no navegador.', 5000);
+    return null;
+  }
+}
+
+function openFirefoxShareModal() {
+  unlockGlobalAudioPlayback();
+  populateFirefoxModalAudioDevices();
+  if (dom.firefoxShareModal) {
+    dom.firefoxShareModal.classList.remove('hidden');
+  }
+  if (state.localExtraAudioStream && state.localExtraAudioStream.getAudioTracks().length > 0) {
+    const t = state.localExtraAudioStream.getAudioTracks()[0];
+    if (dom.firefoxAudioStatus) {
+      dom.firefoxAudioStatus.textContent = `✓ Áudio Conectado: ${t.label || 'Ativo'}`;
+      dom.firefoxAudioStatus.classList.add('status-ready');
+    }
+    startVuMeterForStream(state.localExtraAudioStream);
+  } else if (dom.firefoxAudioStatus) {
+    dom.firefoxAudioStatus.textContent =
+      'Clique em "1. Autorizar e Testar Áudio" ou clique direto no botão 2 para o Firefox pedir Tela + Áudio.';
+    dom.firefoxAudioStatus.classList.remove('status-ready');
+  }
+}
+
+async function injectAudioStreamIntoLiveShare(audioStream) {
+  if (!state.localScreenStream || !audioStream) return;
+
+  for (const oldAudio of state.localScreenStream.getAudioTracks()) {
+    if (!audioStream.getAudioTracks().some((t) => t.id === oldAudio.id)) {
+      state.localScreenStream.removeTrack(oldAudio);
+      try {
+        oldAudio.stop();
+      } catch {}
+    }
+  }
+
+  for (const newAudio of audioStream.getAudioTracks()) {
+    if (!state.localScreenStream.getAudioTracks().some((t) => t.id === newAudio.id)) {
+      state.localScreenStream.addTrack(newAudio);
+    }
+  }
+
+  const streamId = `stream-${state.peerId}`;
+  const quality = state.localQuality || getSelectedQualityConfig();
+  const hasAudio = state.localScreenStream.getAudioTracks().length > 0;
+  const meta = {
+    resolution: quality.label,
+    bitrateMbps: quality.bitrateMbps,
+    codec: quality.codec,
+    hasAudio
+  };
+
+  const localEntry = state.streams.get(streamId);
+  if (localEntry) {
+    localEntry.meta = { ...localEntry.meta, hasAudio };
+    updateAudioBadgeUI(localEntry);
+    if (localEntry.liveAudioBtnEl) {
+      localEntry.liveAudioBtnEl.textContent = '🎤 Trocar Fonte de Áudio';
+      localEntry.liveAudioBtnEl.classList.remove('btn-add-audio-live');
+    }
+  }
+
+  await sendRequest('announceStream', { streamId, meta });
+
+  // Renegocia todas as conexões WebRTC ativas para enviar a nova trilha de áudio ao vivo!
+  for (const [viewerPeerId, senderObj] of state.p2pSenders.entries()) {
+    try {
+      const pc = senderObj.pc;
+      for (const aTrack of state.localScreenStream.getAudioTracks()) {
+        const alreadySent = pc.getSenders().some((s) => s.track && s.track.id === aTrack.id);
+        if (!alreadySent) {
+          pc.addTrack(aTrack, state.localScreenStream);
+        }
+      }
+      const offer = await pc.createOffer();
+      const enhancedOffer = {
+        type: offer.type,
+        sdp: enhanceSdpForStereoAudio(offer.sdp, quality.bitrateMbps)
+      };
+      await pc.setLocalDescription(enhancedOffer);
+      await applyHighQualitySenderParams(pc, quality);
+
+      await sendRequest('p2pSignal', {
+        targetPeerId: viewerPeerId,
+        signalType: 'offer',
+        payload: {
+          sdp: pc.localDescription,
+          meta
+        }
+      });
+    } catch (err) {
+      console.warn('[Live Audio Renegotiation Error]:', err);
+    }
+  }
+
+  // Se houver espectadores em Relay WebSocket, reinicia o gravador com áudio incluso
+  for (const viewerPeerId of state.wsRelayRecorders.keys()) {
+    startWsRelayForViewer(viewerPeerId);
+  }
+
+  showToast('Áudio conectado e transmitindo ao vivo para a sala!');
+}
+
+async function attachLiveAudioToActiveStream() {
+  if (isFirefoxBrowser) {
+    openFirefoxShareModal();
+    return;
+  }
+  await authorizeAndPreviewFirefoxAudio();
+}
+
+// ============================================================================
 // CAPTURA UNIVERSAL DE TELA + ÁUDIO (CHROME / EDGE / FIREFOX / MOBILE)
 // ============================================================================
-async function startScreenShare() {
+async function startScreenShare(fromFirefoxModal = false) {
   unlockGlobalAudioPlayback();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -969,86 +1249,198 @@ async function startScreenShare() {
 
   const quality = getSelectedQualityConfig();
   state.localQuality = quality;
-  const wantAudio = quality.audioSource !== 'none';
 
-  let screenStream;
-  try {
-    screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: quality.width, max: quality.width },
-        height: { ideal: quality.height, max: quality.height },
-        frameRate: { ideal: 60, max: 60 },
-        cursor: 'always'
-      },
-      audio: wantAudio
-        ? {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false
-          }
-        : false,
-      systemAudio: 'include',
-      windowAudio: 'system',
-      surfaceSwitching: 'include',
-      selfBrowserSurface: 'exclude'
-    });
-  } catch {
+  // No Firefox, o seletor nativo de tela da Mozilla não tem a caixinha "Compartilhar áudio do sistema" igual ao Edge.
+  // Por isso abrimos nosso modal estilo Edge antes da captura para o usuário ativar/escolher o áudio!
+  if (isFirefoxBrowser && !fromFirefoxModal && quality.audioSource !== 'none') {
+    openFirefoxShareModal();
     return;
   }
 
-  // SE O NAVEGADOR (EX: FIREFOX OU CAPTURA DE JANELA SEM SOM) NÃO TROUXE TRILHA DE ÁUDIO,
-  // OU SE O USUÁRIO ESCOLHEU UM DISPOSITIVO ESPECÍFICO, PEDIMOS PERMISSÃO DE ÁUDIO VIA getUserMedia!
-  const needsExtraAudio =
+  const wantAudio = fromFirefoxModal
+    ? Boolean(!dom.chkFirefoxIncludeAudio || dom.chkFirefoxIncludeAudio.checked)
+    : quality.audioSource !== 'none';
+
+  // IMPORTANTE PARA FIREFOX:
+  // No Firefox, o gesto de clique (userActivation) expira enquanto o usuário escolhe a janela no getDisplayMedia.
+  // Por isso, se ainda não temos um stream de áudio extra autorizado, disparamos a promessa do getUserMedia
+  // SINCRONAMENTE no mesmo milissegundo do clique (antes do await getDisplayMedia)!
+  let parallelAudioPromise = null;
+  const hasPreAuthorizedAudio =
+    state.localExtraAudioStream &&
+    state.localExtraAudioStream.active &&
+    state.localExtraAudioStream.getAudioTracks().length > 0;
+
+  if (
     wantAudio &&
-    (screenStream.getAudioTracks().length === 0 ||
+    !hasPreAuthorizedAudio &&
+    navigator.mediaDevices.getUserMedia &&
+    (isFirefoxBrowser ||
       quality.audioSource === 'device-default' ||
-      quality.audioSource.startsWith('device:'));
+      quality.audioSource.startsWith('device:'))
+  ) {
+    const audioConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    };
 
-  if (needsExtraAudio && navigator.mediaDevices.getUserMedia) {
-    try {
-      const audioConstraints = {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      };
+    if (fromFirefoxModal && dom.selectFirefoxAudioDevice && dom.selectFirefoxAudioDevice.value !== 'default') {
+      audioConstraints.deviceId = { exact: dom.selectFirefoxAudioDevice.value };
+    } else if (quality.audioSource.startsWith('device:')) {
+      audioConstraints.deviceId = { exact: quality.audioSource.slice('device:'.length) };
+    }
 
-      if (quality.audioSource.startsWith('device:')) {
-        const deviceId = quality.audioSource.slice('device:'.length);
-        audioConstraints.deviceId = { exact: deviceId };
-      }
-
-      const extraAudioStream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints
+    parallelAudioPromise = navigator.mediaDevices
+      .getUserMedia({ audio: audioConstraints })
+      .catch((err) => {
+        console.warn('[Parallel Audio Request]:', err);
+        return null;
       });
+  }
 
-      state.localExtraAudioStream = extraAudioStream;
+  const displayPromise = navigator.mediaDevices.getDisplayMedia({
+    video: {
+      width: { ideal: quality.width, max: quality.width },
+      height: { ideal: quality.height, max: quality.height },
+      frameRate: { ideal: 60, max: 60 },
+      cursor: 'always'
+    },
+    audio: wantAudio
+      ? {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      : false,
+    systemAudio: 'include',
+    windowAudio: 'system',
+    surfaceSwitching: 'include',
+    selfBrowserSurface: 'exclude'
+  });
 
-      // Se o usuário escolheu um dispositivo específico, substitui eventual áudio anterior
+  let screenStream;
+  try {
+    screenStream = await displayPromise;
+  } catch {
+    if (parallelAudioPromise) {
+      parallelAudioPromise.then((s) => {
+        if (s) s.getTracks().forEach((t) => t.stop());
+      });
+    }
+    return;
+  }
+
+  if (dom.firefoxShareModal) {
+    dom.firefoxShareModal.classList.add('hidden');
+  }
+  stopVuMeter();
+
+  // 1. Se já tínhamos áudio autorizado no Assistente Firefox, anexamos ao stream da tela
+  if (wantAudio && hasPreAuthorizedAudio) {
+    for (const aTrack of state.localExtraAudioStream.getAudioTracks()) {
+      if (!screenStream.getAudioTracks().some((t) => t.id === aTrack.id)) {
+        screenStream.addTrack(aTrack);
+      }
+    }
+  }
+
+  // 2. Se disparamos o pedido de áudio em paralelo no mesmo clique, aguardamos ele agora
+  if (wantAudio && parallelAudioPromise) {
+    const parallelAudioStream = await parallelAudioPromise;
+    if (parallelAudioStream && parallelAudioStream.getAudioTracks().length > 0) {
+      state.localExtraAudioStream = parallelAudioStream;
       if (quality.audioSource !== 'auto') {
         for (const oldAudio of screenStream.getAudioTracks()) {
           screenStream.removeTrack(oldAudio);
           oldAudio.stop();
         }
       }
-
-      for (const aTrack of extraAudioStream.getAudioTracks()) {
-        screenStream.addTrack(aTrack);
+      for (const aTrack of parallelAudioStream.getAudioTracks()) {
+        if (!screenStream.getAudioTracks().some((t) => t.id === aTrack.id)) {
+          screenStream.addTrack(aTrack);
+        }
       }
-
       requestAndPopulateAudioDevices(false);
-    } catch (err) {
-      console.warn('[Audio Fallback] Usuário não autorizou dispositivo de áudio extra:', err);
     }
   }
 
+  // 3. Caso o navegador ainda não tenha trilha de áudio (ex: Chrome/Edge compartilhando Janela sem áudio do sistema),
+  // tenta pedir o dispositivo de áudio padrão como fallback final
+  if (wantAudio && screenStream.getAudioTracks().length === 0 && navigator.mediaDevices.getUserMedia && !parallelAudioPromise) {
+    try {
+      const fallbackAudio = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+      state.localExtraAudioStream = fallbackAudio;
+      for (const aTrack of fallbackAudio.getAudioTracks()) {
+        screenStream.addTrack(aTrack);
+      }
+    } catch {}
+  }
+
+  await finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio);
+}
+
+// Permite no Firefox (ou qualquer navegador) transmitir um Arquivo de Vídeo/Filme do PC
+// com Áudio Estéreo 100% Digital Nativo sem precisar de Mixagem Estéreo!
+async function startLocalVideoFileShare(file) {
+  if (!file) return;
+  unlockGlobalAudioPlayback();
+
+  if (state.isSharing) {
+    await stopScreenShare();
+  }
+
+  const quality = getSelectedQualityConfig();
+  state.localQuality = quality;
+
+  const fileUrl = URL.createObjectURL(file);
+  const fileVideo = document.createElement('video');
+  fileVideo.src = fileUrl;
+  fileVideo.loop = true;
+  fileVideo.muted = false;
+  fileVideo.volume = 1.0;
+  fileVideo.playsInline = true;
+  fileVideo.controls = true;
+  state.localFileVideoEl = fileVideo;
+
+  try {
+    await fileVideo.play();
+  } catch (err) {
+    showToast('Erro ao reproduzir o arquivo de vídeo selecionado.');
+    return;
+  }
+
+  const captureFn =
+    fileVideo.captureStream || fileVideo.mozCaptureStream || fileVideo.webkitCaptureStream;
+  if (!captureFn) {
+    showToast('Seu navegador não suporta captura direta de arquivo de vídeo.');
+    return;
+  }
+
+  const capturedStream = captureFn.call(fileVideo);
+  if (dom.firefoxShareModal) {
+    dom.firefoxShareModal.classList.add('hidden');
+  }
+  stopVuMeter();
+
+  await finalizeAndAnnounceLocalStream(capturedStream, quality, true);
+}
+
+async function finalizeAndAnnounceLocalStream(screenStream, quality, wantAudio) {
   const capturedAudioCount = screenStream.getAudioTracks().length;
   if (wantAudio && capturedAudioCount === 0) {
     showToast(
-      'Aviso: Nenhum áudio foi selecionado! Para enviar som do jogo no Chrome/Edge, marque "Compartilhar áudio do sistema" (aba Tela Cheia), ou autorize o dispositivo de áudio no Firefox.',
-      7000
+      'Transmissão iniciada SEM áudio! Clique no botão "➕ Ativar Áudio na Transmissão" abaixo do seu vídeo para ligar o som.',
+      8000
     );
   } else if (capturedAudioCount > 0) {
-    showToast('Transmissão iniciada com Vídeo 1080p60 + Áudio Ativo!');
+    showToast('Transmissão iniciada com Vídeo 1080p60 + Áudio Estéreo Ativo!');
   }
 
   state.localScreenStream = screenStream;
@@ -1104,6 +1496,7 @@ async function startScreenShare() {
 async function stopScreenShare() {
   const streamId = `stream-${state.peerId}`;
   state.isSharing = false;
+  stopVuMeter();
 
   for (const rec of state.wsRelayRecorders.values()) {
     try {
@@ -1118,6 +1511,14 @@ async function stopScreenShare() {
     } catch {}
   }
   state.p2pSenders.clear();
+
+  if (state.localFileVideoEl) {
+    try {
+      state.localFileVideoEl.pause();
+      state.localFileVideoEl.src = '';
+    } catch {}
+    state.localFileVideoEl = null;
+  }
 
   if (state.localExtraAudioStream) {
     for (const t of state.localExtraAudioStream.getTracks()) {
@@ -1410,11 +1811,26 @@ function createStreamCardDOM(entry) {
   audioControls.className = 'audio-controls';
 
   if (entry.isLocal) {
+    const hasAudioNow = Boolean(entry.meta?.hasAudio);
+    const liveAudioBtn = document.createElement('button');
+    liveAudioBtn.type = 'button';
+    liveAudioBtn.className = hasAudioNow
+      ? 'btn-stream-ctrl'
+      : 'btn-stream-ctrl btn-add-audio-live';
+    liveAudioBtn.textContent = hasAudioNow
+      ? '🎤 Trocar Fonte de Áudio'
+      : '➕ Ativar Áudio na Transmissão';
+    liveAudioBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      attachLiveAudioToActiveStream();
+    });
+    entry.liveAudioBtnEl = liveAudioBtn;
+
     const selfLabel = document.createElement('span');
     selfLabel.className = 'mono-label';
     selfLabel.style.color = '#a1a1aa';
     selfLabel.textContent = 'Sua transmissão (Áudio local silenciado para evitar eco)';
-    audioControls.appendChild(selfLabel);
+    audioControls.append(liveAudioBtn, selfLabel);
   } else {
     const muteBtn = document.createElement('button');
     muteBtn.type = 'button';
@@ -1752,6 +2168,54 @@ if (dom.btnDetectAudioDevices) {
   dom.btnDetectAudioDevices.addEventListener('click', (e) => {
     e.stopPropagation();
     requestAndPopulateAudioDevices(true);
+  });
+}
+
+if (dom.btnCloseFirefoxModal) {
+  dom.btnCloseFirefoxModal.addEventListener('click', () => {
+    dom.firefoxShareModal.classList.add('hidden');
+    stopVuMeter();
+  });
+}
+
+if (dom.chkFirefoxIncludeAudio && dom.firefoxAudioConfigArea) {
+  dom.chkFirefoxIncludeAudio.addEventListener('change', () => {
+    dom.firefoxAudioConfigArea.style.display = dom.chkFirefoxIncludeAudio.checked
+      ? 'flex'
+      : 'none';
+  });
+}
+
+if (dom.btnFirefoxTestAudio) {
+  dom.btnFirefoxTestAudio.addEventListener('click', () => {
+    authorizeAndPreviewFirefoxAudio();
+  });
+}
+
+if (dom.selectFirefoxAudioDevice) {
+  dom.selectFirefoxAudioDevice.addEventListener('change', () => {
+    if (state.localExtraAudioStream) {
+      authorizeAndPreviewFirefoxAudio();
+    }
+  });
+}
+
+if (dom.btnFirefoxStartShare) {
+  dom.btnFirefoxStartShare.addEventListener('click', () => {
+    startScreenShare(true);
+  });
+}
+
+if (dom.btnFirefoxShareFile && dom.inputLocalVideoFile) {
+  dom.btnFirefoxShareFile.addEventListener('click', () => {
+    dom.inputLocalVideoFile.value = '';
+    dom.inputLocalVideoFile.click();
+  });
+  dom.inputLocalVideoFile.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) {
+      startLocalVideoFileShare(file);
+    }
   });
 }
 
