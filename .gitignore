@@ -1,0 +1,26 @@
+# Dependências Node.js
+node_modules/
+npm-debug.log*
+
+# Arquivos de ambiente e segredos locais (NUNCA subir pro GitHub)
+.env
+.env.local
+
+# Certificados SSL/TLS gerados localmente
+certs/
+*.pem
+*.key
+*.crt
+
+# Bundle gerado automaticamente pelo esbuild
+public/dist/
+
+# Dados de volume do Caddy (Docker)
+caddy_data/
+caddy_config/
+
+# Sistema operacional e editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

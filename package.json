@@ -1,0 +1,27 @@
+{
+  "name": "tela-stage-sfu",
+  "version": "1.0.0",
+  "description": "Servidor local de compartilhamento de tela em 1080p 60fps com WebRTC SFU (Mediasoup) e Docker",
+  "main": "src/server.js",
+  "scripts": {
+    "build:client": "node scripts/build-client.js",
+    "start": "node src/server.js",
+    "dev": "node scripts/build-client.js && node src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "mediasoup": "^3.14.13",
+    "mediasoup-client": "^3.7.16",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
