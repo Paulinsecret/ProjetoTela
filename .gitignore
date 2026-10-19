@@ -29,3 +29,4 @@ Thumbs.db
 bin/
 tunnel.log
 tunnel.url
+logs/
