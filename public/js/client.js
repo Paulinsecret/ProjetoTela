@@ -19,6 +19,8 @@ const state = {
   localScreenStream: null,
   localQuality: null,
   isSharing: false,
+  isStartingShare: false,
+  shareStartedAt: 0,
 
   // Quem transmite: viewerPeerId -> { pc, sessionId, viewerName, pendingCandidates, prevSample }
   p2pSenders: new Map(),
@@ -106,6 +108,13 @@ const dom = {
   selectContentHint: document.getElementById('select-content-hint'),
   selectAudioSource: document.getElementById('select-audio-source'),
 
+  btnOpenLogs: document.getElementById('btn-open-logs'),
+  logsModal: document.getElementById('logs-modal'),
+  btnCloseLogsModal: document.getElementById('btn-close-logs-modal'),
+  btnRefreshLogs: document.getElementById('btn-refresh-logs'),
+  btnCopyLogs: document.getElementById('btn-copy-logs'),
+  logsViewerContent: document.getElementById('logs-viewer-content'),
+
   btnNetworkInfo: document.getElementById('btn-network-info'),
   networkModal: document.getElementById('network-modal'),
   btnCloseNetworkModal: document.getElementById('btn-close-network-modal'),
@@ -148,10 +157,18 @@ function localStreamId() {
 }
 
 // ============================================================================
-// DIAGNÓSTICO: EVENTOS E RELATÓRIOS ENVIADOS AO SERVIDOR (logs/diag.log)
+// DIAGNÓSTICO: EVENTOS E RELATÓRIOS ENVIADOS AO SERVIDOR (logs/app.log)
 // ============================================================================
 function postDiag(body) {
   if (!state.token) return;
+  // Prioriza envio pelo WebSocket já aberto (evita inundar o Cloudflare Tunnel com requisições HTTP)
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    sendRequest('diag', {
+      browser: BROWSER_NAME,
+      ...body
+    }).catch(() => {});
+    return;
+  }
   try {
     fetch('/api/diag', {
       method: 'POST',
@@ -174,6 +191,20 @@ function logDiagEvent(type, details = {}) {
   console.info('[DIAG]', ev);
   postDiag({ kind: 'event', data: ev });
 }
+
+window.addEventListener('error', (ev) => {
+  logDiagEvent('client-error', {
+    message: ev?.message || 'erro desconhecido',
+    line: ev?.lineno || null
+  });
+});
+
+window.addEventListener('unhandledrejection', (ev) => {
+  const reason = ev?.reason;
+  logDiagEvent('client-unhandled-rejection', {
+    reason: String((reason && reason.message) || reason || 'unknown')
+  });
+});
 
 // ============================================================================
 // ÁUDIO: DESBLOQUEIO DE AUTOPLAY (APENAS PARA TRANSMISSÕES DOS AMIGOS)
@@ -560,8 +591,23 @@ function connectWebSocket() {
   ws.onclose = (ev) => {
     if (state.ws !== ws) return;
     dom.wsStatusDot.className = 'status-dot status-offline';
+
+    // Rejeita imediatamente requisições pendentes para nunca travar a fila de sinalização
+    for (const [reqId, pending] of state.pendingRequests.entries()) {
+      state.pendingRequests.delete(reqId);
+      try {
+        pending.reject(new Error('WebSocket fechado'));
+      } catch {}
+    }
+
+    logDiagEvent('ws-closed', { code: ev.code, reason: ev.reason || '' });
+
     if (ev.code === 4001) {
       logout();
+      return;
+    }
+    // Se foi substituído por outra sessão da mesma aba (4000), não entra em loop de reconexão
+    if (ev.code === 4000) {
       return;
     }
     setTimeout(() => {
@@ -664,7 +710,14 @@ function closeReceiver(streamerId) {
 
 function enqueueSignal(data) {
   state.signalQueue = state.signalQueue
-    .then(() => handleIncomingP2PSignal(data))
+    .then(() =>
+      Promise.race([
+        handleIncomingP2PSignal(data),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout no processamento de sinal WebRTC')), 8000)
+        )
+      ])
+    )
     .catch((err) => {
       console.error('[WebRTC Signal Error]:', err);
       logDiagEvent('signal-error', {
@@ -780,6 +833,7 @@ async function handleIncomingP2PSignal({ fromPeerId, fromDisplayName, signalType
 
     case 'stream-unavailable': {
       if (payload && isCurrentReceiver(fromPeerId, payload.sessionId)) {
+        logDiagEvent('stream-unavailable-received', { from: fromDisplayName, sessionId: payload.sessionId });
         closeReceiver(fromPeerId);
         removeStreamTile(`stream-${fromPeerId}`);
       }
@@ -995,23 +1049,32 @@ function handlePeerLeft({ peerId }) {
 }
 
 // ============================================================================
-// CAPTURA DIRETA ESTILO DISCORD (1 CLIQUE -> SELETOR NATIVO, SEM MICROFONE)
+// CAPTURA DIRETA ESTILO DISCORD (APENAS TELA INTEIRA ENVIA ÁUDIO!)
 // ============================================================================
 function buildMissingAudioMessage(surface) {
   if (isFirefoxBrowser) {
-    return 'O Firefox não envia o áudio da tela. Para transmitir com som, use o Edge ou o Chrome.';
+    return 'O Firefox não envia o áudio da tela. Para transmitir com som, use o Edge ou o Chrome em "Tela inteira".';
   }
-  if (surface === 'window') {
-    return 'Janelas não enviam áudio. Escolha "Guia" ou "Tela inteira" e marque "Compartilhar áudio".';
+  if (surface !== 'monitor') {
+    return 'Apenas "Tela inteira" envia áudio (Janelas e Abas transmitem somente vídeo).';
   }
-  return 'O áudio não foi incluído. Escolha de novo e marque a opção "Compartilhar áudio".';
+  return 'O áudio não foi incluído. Escolha "Tela inteira" e marque a opção "Compartilhar áudio do sistema".';
 }
 
 async function startScreenShare() {
-  if (state.isSharing) return;
+  if (state.isSharing || state.isStartingShare) return;
+  state.isStartingShare = true;
+
+  // Remove o foco do botão para que apertar Espaço/Enter nunca encerre a transmissão por acidente
+  try {
+    if (dom.btnShareScreen) dom.btnShareScreen.blur();
+    if (dom.btnEmptyShare) dom.btnEmptyShare.blur();
+  } catch {}
+
   unlockGlobalAudioPlayback();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    state.isStartingShare = false;
     showToast(
       'O navegador exige conexão segura (HTTPS ou localhost) para compartilhar a tela.',
       6000
@@ -1025,18 +1088,20 @@ async function startScreenShare() {
   const wantAudio = quality.audioSource !== 'none';
 
   if (wantAudio && !isFirefoxBrowser) {
-    showToast('Para enviar som: escolha "Guia" ou "Tela inteira" e marque "Compartilhar áudio".', 6000);
+    showToast('Para enviar som: selecione "Tela inteira" e marque "Compartilhar áudio". (Janelas e Abas enviam apenas vídeo)', 6000);
   }
 
-  // Captura EXCLUSIVAMENTE a tela/janela/guia. NUNCA usa microfone (sem voz duplicada no Discord).
+  // REGRA ESTRITA DE ÁUDIO:
+  // - windowAudio: 'exclude' -> Jamais captura o áudio do PC ao selecionar uma Janela (ex: Firefox/Jogo).
+  // - systemAudio: 'include' -> Permite áudio apenas quando o usuário escolhe "Tela inteira" (monitor).
+  // - E logo após a captura, se surface !== 'monitor', qualquer trilha de áudio é bloqueada e removida!
   let screenStream;
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
-        width: { ideal: quality.width },
-        height: { ideal: quality.height },
-        aspectRatio: { ideal: 16 / 9 },
-        frameRate: { ideal: 60, max: 60 },
+        width: { ideal: quality.width, max: quality.width },
+        height: { ideal: quality.height, max: quality.height },
+        frameRate: { ideal: 60 },
         cursor: 'always'
       },
       audio: wantAudio
@@ -1046,50 +1111,86 @@ async function startScreenShare() {
             autoGainControl: false
           }
         : false,
-      systemAudio: 'include',
-      windowAudio: 'system',
+      systemAudio: wantAudio ? 'include' : 'exclude',
+      windowAudio: 'exclude',
       surfaceSwitching: 'include',
       selfBrowserSurface: 'exclude'
     });
   } catch (err) {
+    state.isStartingShare = false;
     if (!err || err.name !== 'NotAllowedError') {
       showToast(`Não foi possível capturar a tela (${(err && err.name) || 'erro'}).`, 6000);
       logDiagEvent('capture-error', { error: err && err.name, message: err && err.message });
+    } else {
+      logDiagEvent('capture-cancelled-by-user', {});
     }
     return;
   }
 
   const videoTrack = screenStream.getVideoTracks()[0];
-  const localAudioTrack = screenStream.getAudioTracks()[0] || null;
   if (!videoTrack) {
+    state.isStartingShare = false;
     screenStream.getTracks().forEach((t) => t.stop());
     showToast('Nenhuma imagem foi capturada.');
+    logDiagEvent('capture-no-video-track', {});
     return;
   }
 
-  try {
-    await videoTrack.applyConstraints({
-      width: { ideal: quality.width },
-      height: { ideal: quality.height },
-      aspectRatio: { ideal: 16 / 9 },
-      frameRate: { ideal: 60, max: 60 }
+  const settings = (videoTrack.getSettings && videoTrack.getSettings()) || {};
+  const surface = settings.displaySurface || (isFirefoxBrowser ? 'firefox' : 'desconhecido');
+
+  // BLOQUEIO ESTRITO: A única superfície que pode enviar áudio é a TELA INTEIRA (surface === 'monitor')!
+  // Se o usuário selecionou uma aba (browser) ou janela de aplicativo (window), removemos o áudio imediatamente.
+  let localAudioTrack = screenStream.getAudioTracks()[0] || null;
+  let strippedNonMonitorAudio = false;
+
+  if (localAudioTrack && surface !== 'monitor') {
+    for (const aTrack of [...screenStream.getAudioTracks()]) {
+      try {
+        aTrack.stop();
+        screenStream.removeTrack(aTrack);
+      } catch {}
+    }
+    localAudioTrack = null;
+    strippedNonMonitorAudio = true;
+    logDiagEvent('audio-blocked-non-monitor', {
+      surface,
+      reason: 'Apenas Tela Inteira (monitor) tem permissão para enviar áudio'
     });
-  } catch {}
+  }
 
   try {
     videoTrack.contentHint = quality.contentHint === 'detail' ? 'detail' : 'motion';
   } catch {}
 
-  videoTrack.onended = () => {
-    if (state.localScreenStream === screenStream) stopScreenShare();
-  };
-
   state.localScreenStream = screenStream;
   state.isSharing = true;
+  state.isStartingShare = false;
+  state.shareStartedAt = Date.now();
 
-  const settings = (videoTrack.getSettings && videoTrack.getSettings()) || {};
-  const surface = settings.displaySurface || 'desconhecido';
-  const captureWarning = wantAudio && !localAudioTrack ? buildMissingAudioMessage(surface) : null;
+  videoTrack.onended = () => {
+    const durationMs = state.shareStartedAt ? Date.now() - state.shareStartedAt : 0;
+    logDiagEvent('local-video-track-ended', {
+      surface,
+      readyState: videoTrack.readyState,
+      durationMs
+    });
+    if (state.localScreenStream === screenStream) {
+      stopScreenShare('browser-track-ended');
+    }
+  };
+
+  if (localAudioTrack) {
+    localAudioTrack.onended = () => {
+      logDiagEvent('local-audio-track-ended', { surface });
+    };
+  }
+
+  const captureWarning =
+    wantAudio && !localAudioTrack && surface === 'monitor'
+      ? buildMissingAudioMessage(surface)
+      : null;
+
   if (captureWarning) {
     logDiagEvent('no-audio-captured', { surface });
   }
@@ -1107,15 +1208,23 @@ async function startScreenShare() {
   entry.captureWarning = captureWarning;
   refreshAudioUI(entry);
 
-  showToast(
-    localAudioTrack
-      ? 'Transmissão iniciada com áudio da tela. Você está auto-mutado para não se ouvir.'
-      : 'Transmissão iniciada sem áudio.'
-  );
+  if (strippedNonMonitorAudio) {
+    showToast(
+      'Apenas "Tela inteira" envia áudio. Sua janela/aba está sendo transmitida somente com vídeo.',
+      6000
+    );
+  } else if (localAudioTrack) {
+    showToast(
+      'Tela inteira iniciada com áudio! Você está auto-mutado para não se ouvir.'
+    );
+  } else {
+    showToast('Transmissão iniciada (somente vídeo).');
+  }
 
   logDiagEvent('share-started', {
     surface,
     hasAudio: Boolean(localAudioTrack),
+    strippedNonMonitorAudio,
     width: settings.width,
     height: settings.height,
     fps: settings.frameRate,
@@ -1133,9 +1242,16 @@ async function startScreenShare() {
   }
 }
 
-async function stopScreenShare() {
+async function stopScreenShare(reason = 'manual') {
+  state.isStartingShare = false;
   const wasSharing = state.isSharing || Boolean(state.localScreenStream);
+  const durationMs = state.shareStartedAt ? Date.now() - state.shareStartedAt : 0;
   state.isSharing = false;
+  state.shareStartedAt = 0;
+
+  if (wasSharing) {
+    logDiagEvent('share-stopped', { reason, durationMs });
+  }
 
   for (const viewerId of [...state.p2pSenders.keys()]) {
     closeSender(viewerId);
@@ -1144,6 +1260,7 @@ async function stopScreenShare() {
   if (state.localScreenStream) {
     for (const track of state.localScreenStream.getTracks()) {
       try {
+        track.onended = null;
         track.stop();
       } catch {}
     }
@@ -1155,15 +1272,15 @@ async function stopScreenShare() {
 
   if (wasSharing && state.ws && state.ws.readyState === WebSocket.OPEN) {
     try {
-      await sendRequest('stopStream');
+      await sendRequest('stopStream', { reason });
     } catch {}
   }
 }
 
-// Usado pelo botão "Escolher de novo" do aviso de áudio (precisa do clique do usuário)
-function restartScreenShare() {
-  stopScreenShare();
-  startScreenShare();
+// Usado pelo botão "Escolher de novo" do aviso de áudio
+async function restartScreenShare() {
+  await stopScreenShare('restart-picker');
+  await startScreenShare();
 }
 
 function updateShareButtonUI(isSharing) {
@@ -2160,11 +2277,45 @@ function updateRoomStateUI(roomState) {
 // ============================================================================
 // EVENTOS DE INTERFACE E INTERAÇÃO
 // ============================================================================
-function handleShareAction() {
+function handleShareAction(e) {
+  if (e && e.currentTarget && e.currentTarget.blur) {
+    e.currentTarget.blur();
+  }
+  if (state.isStartingShare) return;
+
   if (state.isSharing) {
-    stopScreenShare();
+    // Evita que um clique duplo ou tecla logo após fechar o seletor nativo encerre a transmissão sozinha
+    if (state.shareStartedAt && Date.now() - state.shareStartedAt < 1500) {
+      return;
+    }
+    stopScreenShare('button-click');
   } else {
     startScreenShare();
+  }
+}
+
+async function fetchAndRenderLogs() {
+  if (!dom.logsViewerContent) return;
+  try {
+    const res = await fetch('/api/logs?limit=150&events=1');
+    if (!res.ok) {
+      dom.logsViewerContent.textContent = 'Não foi possível carregar os logs do servidor.';
+      return;
+    }
+    const payload = await res.json();
+    const entries = Array.isArray(payload.entries) ? payload.entries : [];
+    if (entries.length === 0) {
+      dom.logsViewerContent.textContent = 'Nenhum evento registrado ainda.';
+      return;
+    }
+    const lines = entries.map((e) => {
+      const time = e.ts ? e.ts.replace('T', ' ').slice(0, 19) : '';
+      return `[${time}] [${e.displayName} · ${e.browser}] ${JSON.stringify(e.data)}`;
+    });
+    dom.logsViewerContent.textContent = lines.join('\n');
+    dom.logsViewerContent.scrollTop = dom.logsViewerContent.scrollHeight;
+  } catch (err) {
+    dom.logsViewerContent.textContent = `Erro ao buscar logs: ${(err && err.message) || err}`;
   }
 }
 
@@ -2190,6 +2341,31 @@ dom.btnToggleQuality.addEventListener('click', (e) => {
 [dom.selectResolution, dom.selectBitrate, dom.selectCodec, dom.selectContentHint].forEach((sel) => {
   sel.addEventListener('change', updateQualitySummaryPill);
 });
+
+if (dom.btnOpenLogs) {
+  dom.btnOpenLogs.addEventListener('click', () => {
+    dom.logsModal.classList.remove('hidden');
+    fetchAndRenderLogs();
+  });
+}
+
+if (dom.btnRefreshLogs) {
+  dom.btnRefreshLogs.addEventListener('click', fetchAndRenderLogs);
+}
+
+if (dom.btnCopyLogs) {
+  dom.btnCopyLogs.addEventListener('click', () => {
+    navigator.clipboard.writeText(dom.logsViewerContent.textContent || '').then(() => {
+      showToast('Logs copiados para a área de transferência!');
+    });
+  });
+}
+
+if (dom.btnCloseLogsModal) {
+  dom.btnCloseLogsModal.addEventListener('click', () => {
+    dom.logsModal.classList.add('hidden');
+  });
+}
 
 dom.btnNetworkInfo.addEventListener('click', () => {
   fetchServerInfo();
@@ -2217,3 +2393,4 @@ document.addEventListener('click', (e) => {
 
 updateQualitySummaryPill();
 tryAutoLogin();
+

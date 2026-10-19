@@ -203,13 +203,24 @@
               <div class="setting-row">
                 <label for="select-audio-source" class="setting-label">Áudio da Transmissão</label>
                 <select id="select-audio-source" class="setting-select">
-                  <option value="auto" selected>Áudio da Tela / Guia (Nunca usa Microfone)</option>
+                  <option value="auto" selected>Apenas Tela Inteira (Janelas e Abas sem áudio)</option>
                   <option value="none">Sem Áudio (Apenas Vídeo)</option>
                 </select>
               </div>
             </div>
           </div>
         </div>
+
+        <!-- Botão de Logs de Diagnóstico da Sala -->
+        <button type="button" id="btn-open-logs" class="pill-button" title="Acompanhar logs e eventos da sala em tempo real">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+          </svg>
+          <span>Logs</span>
+        </button>
 
         <!-- Botão de Informações de Conexão / Links pros Amigos -->
         <button type="button" id="btn-network-info" class="pill-button" title="Como seus amigos se conectam">
@@ -259,8 +270,7 @@
           <div class="empty-badge mono-label">SERVIDOR PRONTO · 1080P 60FPS</div>
           <h2 class="empty-title">Nenhuma transmissão ativa no momento</h2>
           <p class="empty-description">
-            Compartilhe sua tela inteira ou uma janela específica de jogo com áudio estéreo em alta definição.
-            Mais de uma pessoa pode transmitir simultaneamente.
+            Compartilhe sua <strong>Tela Inteira</strong> para transmitir vídeo + áudio estéreo, ou uma <strong>Janela / Guia</strong> para enviar apenas vídeo.
           </p>
 
           <div class="empty-actions">
@@ -324,6 +334,26 @@
             <span>Configure <code>CADDY_DOMAIN</code> e <code>ANNOUNCED_IP</code> no arquivo <code>.env</code> e redirecione as portas <code>443</code> e <code>40000-40050/udp</code> no roteador.</span>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE LOGS EM TEMPO REAL DA SALA -->
+  <div id="logs-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width: 760px;">
+      <div class="modal-header">
+        <h3>Logs e Eventos da Sala (Tempo Real)</h3>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button type="button" id="btn-refresh-logs" class="btn btn-secondary btn-sm">Atualizar</button>
+          <button type="button" id="btn-copy-logs" class="btn btn-secondary btn-sm">Copiar Logs</button>
+          <button type="button" id="btn-close-logs-modal" class="btn-icon">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <p class="modal-text">
+          Todos os eventos de conexão, início/fechamento de transmissão, áudio e recuperação WebRTC ficam gravados em <code>logs/app.log</code> e <code>logs/diag.jsonl</code> no servidor.
+        </p>
+        <pre id="logs-viewer-content" class="mono-code" style="max-height: 420px; overflow-y: auto; white-space: pre-wrap; line-height: 1.45;">Carregando logs...</pre>
       </div>
     </div>
   </div>
